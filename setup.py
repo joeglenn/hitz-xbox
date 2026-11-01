@@ -212,7 +212,7 @@ def file_hash(*paths):
 
 
 def step_generate(force):
-    say("Generate C code (disasm, classify, ABI, lift)")
+    say("Generate C code (parse XBE, disasm, classify, ABI, lift)")
     try:
         import capstone  # noqa: F401
     except ImportError:
@@ -226,6 +226,8 @@ def step_generate(force):
     xbe = os.path.relpath(GAME / "default.xbe", TOOLKIT)
     py = sys.executable
     t0 = time.time()
+    run([py, "-m", "tools.xbe_parser", xbe, "--json",
+         os.path.relpath(GAME / "default_analysis.json", TOOLKIT)], cwd=TOOLKIT)
     run([py, "-m", "tools.disasm", xbe, "--force"], cwd=TOOLKIT)
     run([py, "-m", "tools.func_id", xbe], cwd=TOOLKIT)
     run([py, "-m", "tools.abi_analysis", xbe], cwd=TOOLKIT)

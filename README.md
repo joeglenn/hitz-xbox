@@ -36,21 +36,56 @@ CLAUDE.md                  phase plan / project overview
 
 ## Requirements
 
-**To generate the code** (Linux, macOS or Windows):
-- git
-- Python 3.12 with `capstone` 5.x (`pip install capstone`)
-- About 2 GB of free disk space
-
-**To build and run** (Windows 10/11 x64):
-- Visual Studio 2022 (or Build Tools) with *Desktop development with C++*. It bundles CMake and Ninja.
+**Windows 10/11 x64** (to build and play):
+- [Git for Windows](https://git-scm.com/download/win)
+- Visual Studio 2022 or the free *Build Tools for Visual Studio 2022*, with the C++ workload. From a command prompt:
+  ```
+  winget install Microsoft.VisualStudio.2022.BuildTools --override "--passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+  ```
 - A D3D11 GPU (feature level 11.1). Tested on an AMD Radeon 8060S.
 - An XInput controller, or the keyboard.
+- About 6 GB of free disk space, and an internet connection on the first run.
 
-You can do everything on Windows, or generate on Linux and copy the whole folder to Windows to build.
+You do not need to install Python: the setup script downloads its own copy into `.tools\`.
 
 ---
 
-## Building from scratch
+## Quick start: one command
+
+```bat
+git clone https://github.com/joeglenn/hitz-xbox.git
+cd hitz-xbox
+setup.bat --iso "D:\Games\NHL Hitz Pro (USA).iso"
+```
+
+Then play with `hitz_pro\run_hitz.bat`, or add `--run` to the setup command to start the game when it finishes.
+
+`setup.bat` does every step in the next section:
+1. Fetches the toolkit, checks out the right commit and applies the patch.
+2. Extracts the disc image. A trimmed xiso or a full redump image both work, and no extra tools are needed.
+3. Checks that it is the USA release (title ID `0x4D57001A`).
+4. Generates the C code.
+5. Builds the exe.
+
+The first run takes about 20–30 minutes, mostly the C++ build. The script can be rerun safely: finished steps are skipped, and the code is only regenerated when the game, the patch or `recomp_manual.c` changes.
+
+Options:
+
+| Option | What it does |
+|---|---|
+| `--iso FILE` | disc image to extract into `hitz_pro\game\` |
+| `--game DIR` | use an already-extracted folder (with `default.xbe`) instead |
+| `--regen` | regenerate the C code even if it looks up to date |
+| `--no-build` | stop after generating the code |
+| `--run` | start the game when done |
+
+**Linux/macOS:** `./setup.sh --iso "NHL Hitz Pro (USA).iso"` does steps 1–4. It needs Python 3.10+ with venv; on Ubuntu, `sudo apt install python3-venv`. Building needs Windows, so copy the whole folder to a Windows PC and run `setup.bat` there; the finished steps are skipped.
+
+---
+
+## Manual steps (what setup does)
+
+You only need this section to understand or debug the setup script. The manual build additionally needs Python 3.10+ with `capstone` (`pip install capstone`).
 
 ### 1. Clone this repo
 
@@ -92,7 +127,7 @@ If `git apply` fails, you are not on the base commit. Run `git status` and check
 
 ### 3. Put the game files in `hitz_pro/game/`
 
-Extract the disc so that `hitz_pro/game/default.xbe` exists next to all the data (`*.pck`, `FE/`, `AI/`, and so on). Any XISO extractor works, for example [extract-xiso](https://github.com/XboxDev/extract-xiso):
+(setup.py has its own extractor.) Extract the disc so that `hitz_pro/game/default.xbe` exists next to all the data (`*.pck`, `FE/`, `AI/`, and so on). Any XISO extractor works, for example [extract-xiso](https://github.com/XboxDev/extract-xiso):
 
 ```sh
 extract-xiso -x "NHL Hitz Pro (USA).iso" -d hitz_pro/game
@@ -104,6 +139,7 @@ Run from inside `xboxrecomp/`:
 
 ```sh
 cd xboxrecomp
+python -m tools.xbe_parser   ../hitz_pro/game/default.xbe --json ../hitz_pro/game/default_analysis.json
 python -m tools.disasm       ../hitz_pro/game/default.xbe --force -v
 python -m tools.func_id      ../hitz_pro/game/default.xbe -v
 python -m tools.abi_analysis ../hitz_pro/game/default.xbe -v
