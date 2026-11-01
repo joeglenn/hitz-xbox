@@ -4,7 +4,9 @@ A static recompilation of **NHL Hitz Pro** (original Xbox, USA, title ID `0x4D57
 
 The game's x86 code is translated to C ahead of time and compiled with MSVC. Xbox hardware (NV2A GPU, APU audio, USB pads, kernel) is emulated by the toolkit runtime. Graphics run on the host GPU through a D3D11 back end in this repo.
 
-**Status:** boots, menus work, and an exhibition match is playable at 60 fps, single player or two players on one machine, with sound. Netplay is the next phase.
+**Status:** boots, menus work, and an exhibition match is playable at 60 fps, single player or two players on one machine, with sound.
+
+This repo is the plain port. Online play lives in a separate edition, [hitz-xbox-netplay](https://github.com/joeglenn/hitz-xbox-netplay): the same port plus lockstep netplay and its relay server.
 
 > **No game data is included.** You need your own copy of NHL Hitz Pro. The generated C code is derived from the game executable, so it is not in this repo either; you rebuild it from your copy (step 4).
 
@@ -78,6 +80,8 @@ Options:
 | `--regen` | regenerate the C code even if it looks up to date |
 | `--no-build` | stop after generating the code |
 | `--run` | start the game when done |
+
+**Updating:** `git pull`, then run `setup.bat` again. It regenerates the code and rebuilds only if the patch or the overrides changed.
 
 **Linux/macOS:** `./setup.sh --iso "NHL Hitz Pro (USA).iso"` does steps 1–4. It needs Python 3.10+ with venv; on Ubuntu, `sudo apt install python3-venv`. Building needs Windows, so copy the whole folder to a Windows PC and run `setup.bat` there; the finished steps are skipped.
 

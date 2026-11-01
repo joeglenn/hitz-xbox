@@ -19,11 +19,10 @@ owner's own notes about their own property. Work on the port code, runtime
 glue, build system, and bug fixes — there is no step in this project that
 requires you to extract, download, or distribute any copyrighted asset.
 
-## Current status (as of handoff)
+## Current status
 
-The whole Python pipeline (steps 2–5 of GETTING_STARTED.md) has already been
-run. You are resuming after code generation, at the "fill in glue + build +
-debug" stage:
+The Windows port is complete (2026-11-01). Next phase: the Xbox One X port
+(see below). Steps as originally run:
 
 | Step | Tool | Status |
 |---|---|---|
@@ -35,7 +34,10 @@ debug" stage:
 | 5. Lift to C | `tools.recomp --all --split 250` | done — `hitz_pro/src/recomp/gen/` |
 | 6. Project glue | `hitz_pro/` | done — see below |
 | 7. Windows build | MSVC in the win11 VM | done — builds clean, boots to title screen (NOTES 10-31) |
-| 8. Boot/debug loop | VM, run_xbox.ps1 | **← IN PROGRESS: input → menus → gameplay, audio** |
+| 8. Boot/debug loop | VM, run_xbox.ps1 | done — menus, exhibition match, 2 pads, sound |
+| 9. GPU back end | `hitz_pro/src/nv2a_d3d11.c` | done — 60 fps in matches (NOTES 11-01) |
+| 10. Publish | GitHub + `setup.bat`/`setup.sh` | done — one-command setup, fresh-clone tested |
+| 11. Netplay | separate repo hitz-xbox-netplay | done there; none in this repo |
 
 ## Directory layout (on odin, `~/hitz-xbox/`)
 
@@ -111,7 +113,13 @@ Debug loop (expect crashes on first boot — that is normal):
 - AV at 0xFD...... → NV2A MMIO not initialized; 0xFE...... → APU MMIO.
 - Every diagnosis and fix gets a dated line in `NOTES.md`.
 
-## LATER PHASE — online netplay (do NOT start until the Windows port is complete)
+## Netplay — done, in the separate hitz-xbox-netplay repo
+
+Netplay lives in https://github.com/joeglenn/hitz-xbox-netplay; this repo stays the
+plain port with no netplay code. Fixes that apply to both land here first and
+are then merged into the netplay repo. The original plan follows.
+
+### Original plan
 
 Owner's order: finish input, sound and the rest of the Windows port first.
 Only then netplay, then the Xbox One X phase.
@@ -136,7 +144,7 @@ recompiled C (Microsoft's Xbox dev mode + a UWP shell around the D3D11 code),
 or continued testing via streaming/remote. Treat this as a follow-on project:
 do not block the Windows build on it.
 
-## Known issues at handoff (fix these first)
+## Known issues at the original handoff (historical: all fixed, see NOTES.md)
 
 1. **`dr4` undeclared (build blocker, trivial).** The binary contains four
    `mov dr4, esp` instructions (0x11A4B2, 0x11A554, 0x11AA2A, 0x11AACC — see
