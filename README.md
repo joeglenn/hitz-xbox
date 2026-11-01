@@ -67,7 +67,7 @@ Then play with `hitz_pro\run_hitz.bat`, or add `--run` to the setup command to s
 4. Generates the C code.
 5. Builds the exe.
 
-The first run takes about 20–30 minutes, mostly the C++ build. The script can be rerun safely: finished steps are skipped, and the code is only regenerated when the game, the patch or `recomp_manual.c` changes.
+The first run took 16 minutes in testing (8-core Windows VM): about 15 for code generation and 1 for the build. The script can be rerun safely: finished steps are skipped, and the code is only regenerated when the game, the patch or `recomp_manual.c` changes.
 
 Options:
 
@@ -167,7 +167,7 @@ If the link fails with "cannot open file", the game is still running. Close it, 
 
 ### 6. Run
 
-Double-click `hitz_pro\run_hitz.bat`, or run it from a command prompt. It starts the exe with `hitz_pro\` as the working directory, which is where it finds `game\default.xbe`. Log output goes to `hitz_pro\hitz_stderr.log`.
+Double-click `hitz_pro\run_hitz.bat`, or run it from a command prompt. It starts the exe with `hitz_pro\` as the working directory, which is where it finds `game\default.xbe`. Log output goes to `hitz_pro\hitz_stderr.log`; it reports fps every 10 s.
 
 ---
 
