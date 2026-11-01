@@ -346,3 +346,6 @@ constants per batch; hardware clipping with DepthClip on). The CPU path stays fo
 **Tools:** `tools/vmbuild.sh <n> files...` builds and fetches the map. `tools/runsum.sh <boot>...` prints a one-line summary per run. Only one VM run at a time: runs share the VM output folder.
 
 **Netplay starting point:** two local pads already drive the game through `usb_gamepad_report(pad, ...)`. The pad-script hook (`pad_script_apply`) is where remote input gets injected. Game time is paced by the guest vblank clock (`RECOMP_VBLANK=paced` + flip hold), which is the frame boundary for exchanging inputs.
+
+## 2026-11-01 (night)
+Ice smear fixed: inline-array layout sized short attributes at 4 bytes/component (draw_inline_array now uses attr_elem_bytes, dword padded). Layout seen: s16x2 pos + D3DCOLOR + ub2 = 12 bytes (was laid out as 16). Same bug class as xemu #1850. Verified on an identical replay: smear in ~half of in-match shots before, none in 24 after; 60 fps.
