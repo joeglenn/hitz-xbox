@@ -1,0 +1,18 @@
+# Whitelist: game data, ISO, VM, runs and the toolkit clone never leave odin.
+/*
+!/.gitignore
+!/README.md
+!/CLAUDE.md
+!/NOTES.md
+!/xboxrecomp-hitz.patch
+!/tools/
+/tools/extract-xiso
+/tools/LICENSE.TXT
+!/hitz_pro/
+/hitz_pro/build/
+/hitz_pro/src/recomp/
+*.pre-*
+*.bak*
+*.v1-working
+*.v2-gpuvsh
+*.boot035-good

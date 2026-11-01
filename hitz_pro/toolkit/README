@@ -1,0 +1,3 @@
+xboxrecomp-hitz.patch: the toolkit changes this project needs, against the xboxrecomp commit in BASE_COMMIT.
+src/recomp/gen/ is not tracked: regenerate it with
+  cd ../xboxrecomp && python -m tools.recomp ../game/default.xbe --all --split 250 --gen-dir ../hitz_pro/src/recomp/gen --exclude-manual ../hitz_pro/src/recomp_manual.c
