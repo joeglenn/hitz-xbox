@@ -2,6 +2,10 @@
 /*
 !/.gitignore
 !/README.md
+!/.gitattributes
+!/setup.py
+!/setup.sh
+!/setup.bat
 !/CLAUDE.md
 !/NOTES.md
 !/xboxrecomp-hitz.patch
@@ -12,6 +16,7 @@
 /hitz_pro/build/
 /hitz_pro/src/recomp/
 /hitz_pro/game/
+/hitz_pro/game.partial/
 /hitz_pro/hitz_stderr.log
 *.pre-*
 *.bak*
