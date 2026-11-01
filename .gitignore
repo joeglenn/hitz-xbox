@@ -11,6 +11,8 @@
 !/hitz_pro/
 /hitz_pro/build/
 /hitz_pro/src/recomp/
+/hitz_pro/game/
+/hitz_pro/hitz_stderr.log
 *.pre-*
 *.bak*
 *.v1-working

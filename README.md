@@ -1,10 +1,225 @@
 # hitz-xbox
 
-Static recompilation of NHL Hitz Pro (original Xbox) to Windows x64 with xboxrecomp.
+A static recompilation of **NHL Hitz Pro** (original Xbox, USA, title ID `0x4D57001A`) to a native Windows x64 program. It is built on the [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit.
 
-- hitz_pro/: the project (hand overrides, D3D11 GPU back end, profiler, build scripts)
-- xboxrecomp-hitz.patch: toolkit changes against the xboxrecomp commit in hitz_pro/toolkit/BASE_COMMIT
-- tools/: VM build/run, profiling and GPU passthrough helpers
-- NOTES.md / CLAUDE.md: progress log and phase plan
+The game's x86 code is translated to C ahead of time and compiled with MSVC. Xbox hardware (NV2A GPU, APU audio, USB pads, kernel) is emulated by the toolkit runtime. Graphics run on the host GPU through a D3D11 back end in this repo.
 
-No game data is included. You need your own copy of the game; generated code (hitz_pro/src/recomp/gen) is rebuilt from it (see hitz_pro/toolkit/README).
+**Status:** boots, menus work, and an exhibition match is playable at 60 fps, single player or two players on one machine, with sound. Netplay is the next phase.
+
+> **No game data is included.** You need your own copy of NHL Hitz Pro. The generated C code is derived from the game executable, so it is not in this repo either; you rebuild it from your copy (step 4).
+
+---
+
+## Repo layout
+
+```
+hitz_pro/                  the game project
+  CMakeLists.txt           builds hitz_pro_recomp.exe against ../xboxrecomp
+  build_windows.bat        MSVC + Ninja build (finds Visual Studio on its own)
+  run_hitz.bat             launcher with the default settings
+  src/main.c               entry point, title defaults, crash handler
+  src/recomp_manual.c      hand-written overrides of recompiled functions
+  src/recomp_kick.c        D3D KickOff without the PFB-flush spin
+  src/nv2a_d3d11.c         NV2A -> D3D11 renderer (vertex programs, combiners on the GPU)
+  src/hostprof_win.c       sampling profiler (HITZ_HOSTPROF=1)
+  src/recomp/gen/          generated code -- NOT in the repo, you create it (step 4)
+  game/                    your game files -- NOT in the repo (step 3)
+  toolkit/BASE_COMMIT      the xboxrecomp commit the patch applies to
+  toolkit/xboxrecomp-hitz.patch   toolkit changes this game needs
+xboxrecomp-hitz.patch      same patch (top-level copy)
+tools/                     helper scripts used during development (see below)
+NOTES.md                   dated engineering log: every bug and fix
+CLAUDE.md                  phase plan / project overview
+```
+
+---
+
+## Requirements
+
+**To generate the code** (Linux, macOS or Windows):
+- git
+- Python 3.12 with `capstone` 5.x (`pip install capstone`)
+- About 2 GB of free disk space
+
+**To build and run** (Windows 10/11 x64):
+- Visual Studio 2022 (or Build Tools) with *Desktop development with C++*. It bundles CMake and Ninja.
+- A D3D11 GPU (feature level 11.1). Tested on an AMD Radeon 8060S.
+- An XInput controller, or the keyboard.
+
+You can do everything on Windows, or generate on Linux and copy the whole folder to Windows to build.
+
+---
+
+## Building from scratch
+
+### 1. Clone this repo
+
+```sh
+git clone https://github.com/joeglenn/hitz-xbox.git
+cd hitz-xbox
+```
+
+When you are done, the tree looks like this:
+
+```
+hitz-xbox/
+  hitz_pro/
+    game/default.xbe ...   (step 3)
+    src/recomp/gen/ ...    (step 4)
+  xboxrecomp/              (step 2)
+```
+
+### 2. Get the toolkit and apply the patch
+
+```sh
+git clone https://github.com/sp00nznet/xboxrecomp.git
+cd xboxrecomp
+git checkout $(cat ../hitz_pro/toolkit/BASE_COMMIT)    # f0f8a46, v0.16.0
+git apply --check ../xboxrecomp-hitz.patch              # dry run, should print nothing
+git apply ../xboxrecomp-hitz.patch
+cd ..
+```
+
+On Windows cmd, use `git checkout f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b` instead of `$(cat ...)`.
+
+The patch has to go in **before** you generate code, because it also fixes the lifter (`tools/recomp/lifter.py`). In summary, it changes:
+- **Lifter:** debug-register moves (`mov drN`).
+- **NV2A:** pushbuffer DMA walk with flip-hold stop and resume; walk bounds checks; back-end hooks (`draw_x`, `draw_vsh`) used by the D3D11 renderer; the software-method (notify) interrupt; log gating.
+- **Kernel:** `xbox_SignalGuestEvent` for D3D's GPU-interrupt event; file and memory fixes.
+- **USB:** the OHCI controller with up to 4 pads and the pad-script tool.
+
+If `git apply` fails, you are not on the base commit. Run `git status` and check it out again.
+
+### 3. Put the game files in `hitz_pro/game/`
+
+Extract the disc so that `hitz_pro/game/default.xbe` exists next to all the data (`*.pck`, `FE/`, `AI/`, and so on). Any XISO extractor works, for example [extract-xiso](https://github.com/XboxDev/extract-xiso):
+
+```sh
+extract-xiso -x "NHL Hitz Pro (USA).iso" -d hitz_pro/game
+```
+
+### 4. Generate the C code
+
+Run from inside `xboxrecomp/`:
+
+```sh
+cd xboxrecomp
+python -m tools.disasm       ../hitz_pro/game/default.xbe --force -v
+python -m tools.func_id      ../hitz_pro/game/default.xbe -v
+python -m tools.abi_analysis ../hitz_pro/game/default.xbe -v
+python -m tools.recomp       ../hitz_pro/game/default.xbe --all --split 250 \
+    --gen-dir ../hitz_pro/src/recomp/gen \
+    --exclude-manual ../hitz_pro/src/recomp_manual.c
+cd ..
+```
+
+Notes:
+- **Do not pass `--text-only` to the disassembler.** The XDK library sections (D3D, DSOUND, XGRPH, and so on) contain code, and without them you lose about 3,000 functions.
+- **Do not skip `--exclude-manual`.** It makes the generator rename every function overridden in `recomp_manual.c` to `sub_XXXXXXXX_gen`, so the override wraps it. The log should report the wrapped functions. Without it, the link fails with duplicate symbols.
+- Expect about 19,200 functions, about 65 MB of C in `hitz_pro/src/recomp/gen/`, and a few minutes of run time.
+
+### 5. Build (Windows)
+
+```bat
+cd hitz_pro
+build_windows.bat
+```
+
+The script loads the MSVC environment through `vswhere`, then runs CMake and Ninja in Release mode. The first build compiles 16k+ generated functions and takes about 10 minutes on a fast machine; later builds are incremental. The output is `hitz_pro\build\hitz_pro_recomp.exe`.
+
+If the link fails with "cannot open file", the game is still running. Close it, or run `taskkill /F /IM hitz_pro_recomp.exe`.
+
+### 6. Run
+
+Double-click `hitz_pro\run_hitz.bat`, or run it from a command prompt. It starts the exe with `hitz_pro\` as the working directory, which is where it finds `game\default.xbe`. Log output goes to `hitz_pro\hitz_stderr.log`.
+
+---
+
+## Controls
+
+**XInput controllers** (Xbox 360/One/Series pads) map one-to-one to the Xbox pad.
+
+For two players on one machine, plug in two controllers. `run_hitz.bat` sets `RECOMP_USB_PADS=2`. On the team-select screen each player pushes the stick toward **Away** or **Home**, then presses **A**.
+
+**Keyboard** (`set RECOMP_KEYBOARD=1` before running, player 1):
+
+| Key | Pad |
+|---|---|
+| W A S D / keypad | left stick |
+| Arrow keys | D-pad |
+| Z / X / C / V | A / B / X / Y |
+| Q / E | White / Black |
+| Enter | Start |
+| Backspace | Back |
+
+---
+
+## Settings (environment variables)
+
+You only need these to change behaviour or to debug. `main.c` and `run_hitz.bat` already set the ones the game needs. Anything you set yourself overrides the default.
+
+**Needed (set by default):**
+
+| Variable | Default | What it does |
+|---|---|---|
+| `RECOMP_PB_EXEC` | 1 | run the GPU pushbuffer executor |
+| `RECOMP_PB_WALK` | dma | follow the pushbuffer like the hardware. The older segment scan hangs in heavy scenes. |
+| `RECOMP_VBLANK` | paced | real-time 60 Hz vblank |
+| `RECOMP_FLIP_PACING` | 1 | flips wait for vblank: 60 fps and correct game speed |
+| `RECOMP_TITLE_KEVENTS` | 1 | lets the GPU signal D3D's interrupt event |
+| `RECOMP_AC97_READY` | 1 | audio codec ready |
+| `RECOMP_FB_WINDOW`, `RECOMP_D3D_PRESENT` | 1 | open the game window and present to it |
+| `RECOMP_USB` | 1 | emulated USB controllers |
+| `HITZ_GPU` | 1 | D3D11 renderer. 0 = the toolkit's CPU rasteriser, about 1 fps. |
+
+**Optional:**
+
+| Variable | What it does |
+|---|---|
+| `RECOMP_USB_PADS=1..4` | number of controllers |
+| `RECOMP_KEYBOARD=1` | keyboard as pad 1 |
+| `HITZ_GPU_ADAPTER=<text>` | pick the GPU whose name contains the text |
+| `HITZ_GPU_VSH=0` | vertex programs on the CPU instead of the GPU |
+| `HITZ_GPU_UBER=1` | one general pixel shader instead of per-state ones (slower; for checking) |
+| `HITZ_GPU_SYNC_READBACK=1` | old synchronous render-target readback |
+
+**Debugging:**
+
+| Variable | What it does |
+|---|---|
+| `HITZ_GPU_PROF=1` | per-draw GPU timings |
+| `HITZ_GPU_TRACE=1` | dump all draws of one light frame every 5 s |
+| `HITZ_GPU_FLATPS=1` | vertex colour only (separates geometry bugs from shading bugs) |
+| `HITZ_HOSTPROF=1` | sampling profiler writing `C:\proj\hprof.txt`; resolve it with `tools/hostprof_resolve.py` |
+| `HITZ_DIAG=1` | bring-up diagnostics in `recomp_manual.c` |
+| `RECOMP_DRAW_LOG`, `RECOMP_PATH_LOG`, `RECOMP_READ_LOG`, `RECOMP_GPU_REPORT` | verbose toolkit logs (slow) |
+| `RECOMP_WATCHDOG_SECS=N` | dump guest state if the game hasn't exited after N seconds |
+| `RECOMP_PAD_SCRIPT=<ms>:<button>[:hold],...` | scripted input for unattended tests, e.g. `58000:start,64000:start,72000:a`. `p2-` targets pad 2. |
+
+---
+
+## Changing things
+
+- **Overriding a game function:** define `void sub_XXXXXXXX(void)` in `hitz_pro/src/recomp_manual.c`, call `sub_XXXXXXXX_gen()` for the original, then rerun step 4 (with `--exclude-manual`) and rebuild. Guest registers are the globals `g_eax`, `g_esp` and so on; guest memory is `MEM32(addr)`.
+- **Toolkit changes:** edit in `xboxrecomp/`, then refresh both copies of the patch:
+  ```sh
+  cd xboxrecomp && git diff > ../xboxrecomp-hitz.patch && cp ../xboxrecomp-hitz.patch ../hitz_pro/toolkit/
+  ```
+- **Crashes:** the crash handler prints the exe base and RVAs. Map them to function names with
+  `python tools/rva2sym.py hitz_pro/build/hitz_pro_recomp.map <rva> ...`.
+- Read `NOTES.md` before changing anything in D3D, the pushbuffer or the fences; it explains why each fix exists.
+
+## tools/
+
+The scripts in `tools/` come from the original dev setup: a Windows VM on Linux with GPU passthrough. They are machine-specific; use them as references.
+
+| Script | What it does |
+|---|---|
+| `vmbuild.sh`, `runvm.sh`, `runsum.sh` | build in the VM, do a timed run, summarise the run |
+| `hostprof_resolve.py`, `hp_diff.py`, `rva2sym.py` | profiling and crash symbolisation (portable) |
+| `gpu-vfio-boot.sh`, `win11-gpu.sh`, `mk_vfct.py` | AMD iGPU passthrough to a dockurr/windows VM |
+
+## Credits
+
+- [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) by sp00nznet and contributors. The patch here is a derivative of it; see its licence.
+- NHL Hitz Pro © Midway / NHL / NHLPA. This repo contains no game code or assets.
