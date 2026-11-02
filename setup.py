@@ -228,7 +228,12 @@ def step_generate(force):
     t0 = time.time()
     run([py, "-m", "tools.xbe_parser", xbe, "--json",
          os.path.relpath(GAME / "default_analysis.json", TOOLKIT)], cwd=TOOLKIT)
+    print("  Disassembling the game: this is the slow part (several minutes, longer\n"
+          "  on a slow PC or drive) and prints nothing until it finishes. It is not\n"
+          "  stuck; leave the window open.", flush=True)
+    t1 = time.time()
     run([py, "-m", "tools.disasm", xbe, "--force"], cwd=TOOLKIT)
+    print("  disassembly took %.0f s" % (time.time() - t1), flush=True)
     run([py, "-m", "tools.func_id", xbe], cwd=TOOLKIT)
     run([py, "-m", "tools.abi_analysis", xbe], cwd=TOOLKIT)
     if GEN.exists():
