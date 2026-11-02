@@ -1942,6 +1942,8 @@ static uint16_t argb_to_565(uint32_t c)
     return (uint16_t)((((c >> 19) & 31) << 11) | (((c >> 10) & 63) << 5) | ((c >> 3) & 31));
 }
 
+static int s_copies_queued;   /* this flip queued readback copies: flush them */
+
 static void be_flip(void)
 {
     unsigned long long t0;
@@ -1983,6 +1985,7 @@ static void be_flip(void)
                     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)r->staging, (ID3D11Resource *)r->tex);
                     r->dirty = 0;
                     r->pending = 1;
+                    s_copies_queued = 1;
                     if (!sync) continue;
                 }
                 if (r->pending && (pass == 0 || sync)) {
@@ -1990,8 +1993,16 @@ static void be_flip(void)
                     uint32_t y, x;
                     uint8_t *g;
                     unsigned long long tm = now_ns();
+                    /* Wait for last flip's copy (it was flushed to the GPU
+                     * then, so this is normally already done). Polling with
+                     * DO_NOT_WAIT used to fail on about half the in-match
+                     * flips on NVIDIA; each miss dropped or repeated a frame
+                     * on screen: smooth 60 fps by the counters, visibly
+                     * jittery. HITZ_GPU_READBACK_POLL=1 restores polling. */
+                    static int poll = -1;
+                    if (poll < 0) { const char *e = getenv("HITZ_GPU_READBACK_POLL"); poll = e && *e == '1'; }
                     HRESULT mh = ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)r->staging, 0, D3D11_MAP_READ,
-                                                         sync ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+                                                         (sync || !poll) ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
                     if (mh == DXGI_ERROR_WAS_STILL_DRAWING) { s_st.rb_late++; continue; }
                     if (FAILED(mh))
                         continue;
@@ -2012,6 +2023,12 @@ static void be_flip(void)
                 }
             }
         }
+    }
+    /* Send this flip's copies to the GPU now, so they are finished by the
+     * next flip's Map instead of waiting in the driver's command buffer. */
+    if (s_copies_queued) {
+        s_copies_queued = 0;
+        ID3D11DeviceContext_Flush(s_ctx);
     }
     /* GPU frame time: [disjoint, t_start] at frame begin, [t_end, end disjoint]
      * at its flip; results collected 3 frames later. */
