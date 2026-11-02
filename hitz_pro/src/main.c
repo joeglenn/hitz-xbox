@@ -31,6 +31,9 @@
  */
 
 #include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+static void hitz_log_drain(void);   /* the log pipe, below */
 #include <dbghelp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -286,26 +289,90 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             }
         }
         fflush(stderr);
+        hitz_log_drain();
     }
 
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* stderr is unbuffered on Windows: every line was a synchronous write under
- * the CRT lock, and with the log on the VM's disk that cost the executor
- * thread ~40% of its time. Buffer it; flush every 250 ms (and on crash). */
-static void flush_stderr_atexit(void) { fflush(stderr); }
-static DWORD WINAPI s_log_flusher(LPVOID p)
+/* The log (stderr) never blocks a game thread.
+ *
+ * stderr went straight to its file or pipe, one synchronous write per line
+ * under the CRT lock, from whichever thread logged. The toolkit's kernel
+ * summary (seven lines every 2 s, from the game thread) measured 45-180 ms
+ * when the log's reader was slow: a visible hitch every two seconds. An
+ * earlier fix buffered stderr, but a later setvbuf(_IONBF) in WinMain undid
+ * it, and the toolkit fflushes after most lines anyway.
+ *
+ * Now fd 2 is the write end of an in-memory pipe (4 MB); a background thread
+ * copies it to the real destination. A write is a memory copy unless 4 MB of
+ * log is waiting, and it still reaches the file within milliseconds, so the
+ * log stays useful after a crash (the crash handler drains it too).
+ * HITZ_LOG_DIRECT=1 writes directly, as before. */
+static HANDLE s_log_rd, s_log_out;
+static CRITICAL_SECTION s_log_cs;
+
+static void hitz_log_drain(void)
 {
-    (void)p;
-    for (;;) { Sleep(250); fflush(stderr); }
+    char buf[16384];
+    DWORD avail, got, put;
+    if (!s_log_rd)
+        return;
+    EnterCriticalSection(&s_log_cs);
+    while (PeekNamedPipe(s_log_rd, NULL, 0, NULL, &avail, NULL) && avail) {
+        if (!ReadFile(s_log_rd, buf, avail < sizeof buf ? avail : sizeof buf, &got, NULL) || !got)
+            break;
+        WriteFile(s_log_out, buf, got, &put, NULL);
+    }
+    LeaveCriticalSection(&s_log_cs);
 }
-static void hitz_log_buffering(void)
+
+static DWORD WINAPI s_log_pump(LPVOID p)
 {
-    if (getenv("HITZ_LOG_UNBUFFERED")) return;
-    setvbuf(stderr, NULL, _IOFBF, 1u << 20);
-    CloseHandle(CreateThread(NULL, 0, s_log_flusher, NULL, 0, NULL));
-    atexit(flush_stderr_atexit);
+    char buf[16384];
+    DWORD got, put;
+    (void)p;
+    for (;;) {
+        /* Blocks until something is logged; the lock only orders it with a
+         * crash-time drain. */
+        if (!ReadFile(s_log_rd, buf, sizeof buf, &got, NULL) || !got)
+            return 0;
+        EnterCriticalSection(&s_log_cs);
+        WriteFile(s_log_out, buf, got, &put, NULL);
+        LeaveCriticalSection(&s_log_cs);
+    }
+}
+
+static void hitz_log_async(void)
+{
+    HANDLE wr;
+    int fd;
+    if (getenv("HITZ_LOG_DIRECT"))
+        return;
+    {
+        /* Our own copy of the destination: _dup2 below closes fd 2's handle. */
+        HANDLE orig = GetStdHandle(STD_ERROR_HANDLE);
+        if (!orig || orig == INVALID_HANDLE_VALUE
+            || !DuplicateHandle(GetCurrentProcess(), orig, GetCurrentProcess(), &s_log_out,
+                                0, FALSE, DUPLICATE_SAME_ACCESS))
+            return;                             /* no stderr at all: nothing to protect */
+    }
+    if (!CreatePipe(&s_log_rd, &wr, NULL, 4u << 20)) {
+        CloseHandle(s_log_out);
+        return;
+    }
+    fd = _open_osfhandle((intptr_t)wr, _O_WRONLY | _O_BINARY);
+    if (fd < 0 || _dup2(fd, 2) != 0) {
+        CloseHandle(s_log_rd);
+        s_log_rd = NULL;
+        if (fd >= 0) _close(fd); else CloseHandle(wr);
+        return;
+    }
+    _close(fd);                                 /* fd 2 keeps its own copy */
+    SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(2));
+    InitializeCriticalSection(&s_log_cs);
+    CloseHandle(CreateThread(NULL, 0, s_log_pump, NULL, 0, NULL));
+    atexit(hitz_log_drain);
 }
 
 /* ── WinMain ───────────────────────────────────────────────── */
@@ -321,7 +388,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
-    hitz_log_buffering();
+    hitz_log_async();
 
     /* Title defaults (an explicit environment setting wins). */
     {
@@ -336,7 +403,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                 _putenv_s(defaults[i][0], defaults[i][1]);
     }
 
-    /* Unbuffered output for immediate visibility during debugging */
+    /* The launcher's settings (HITZ_*) onto the toolkit's names, with the
+     * defaults for a game started any other way (run_hitz.bat, the exe). */
+    {
+        static const char *const map[][3] = {
+            /* launcher name          toolkit name             default */
+            { "HITZ_PACING",         "RECOMP_PACING",         "auto" },  /* lock frames to the display */
+            { "HITZ_REFRESH_SWITCH", "RECOMP_REFRESH_SWITCH", "1" },     /* fullscreen: 60 Hz multiple */
+            { "HITZ_PERF_LOG",       "RECOMP_PERF_LOG",       "1" },     /* hitz_perf.log, F9 marks */
+            { "HITZ_SDL_PADS",       "RECOMP_SDL_PADS",       "1" },     /* non-Xbox controllers */
+        };
+        size_t i;
+        for (i = 0; i < sizeof map / sizeof map[0]; i++)
+            if (!getenv(map[i][1])) {
+                const char *v = getenv(map[i][0]);
+                _putenv_s(map[i][1], v && *v ? v : map[i][2]);
+            }
+        if (!getenv("RECOMP_PERF_LOG_FILE"))
+            _putenv_s("RECOMP_PERF_LOG_FILE", "hitz_perf.log");
+    }
+
+    /* Unbuffered: every line goes into the log pipe at once (hitz_log_async),
+     * which costs a memory copy, and is on disk within milliseconds. */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 

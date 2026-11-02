@@ -1,8 +1,837 @@
+diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
+index ae6228d..0340975 100644
+--- a/src/input/CMakeLists.txt
++++ b/src/input/CMakeLists.txt
+@@ -15,6 +15,9 @@ target_link_libraries(xbox_input PUBLIC xbox_input_map)
+ if(WIN32)
+     # Mouse+keyboard pad (RECOMP_MKB) reads Win32 raw input.
+     target_sources(xbox_input PRIVATE mkb_input.c)
++    # Non-XInput pads (Switch Pro, 8BitDo, PlayStation) through SDL2.dll,
++    # bound at run time: no SDL headers or import library at build time.
++    target_sources(xbox_input PRIVATE sdl_pads_win.c)
+     # mingw-w64's libxinput.a imports XINPUT1_3.dll, the DirectX June 2010
+     # redistributable: stock Windows 10/11 lacks it and the exe dies with
+     # 0xC0000135 before main. Proton ships it, so only native Windows shows
+diff --git a/src/input/sdl_pads_win.c b/src/input/sdl_pads_win.c
+new file mode 100644
+index 0000000..4e114b7
+--- /dev/null
++++ b/src/input/sdl_pads_win.c
+@@ -0,0 +1,414 @@
++/*
++ * sdl_pads_win.c - see sdl_pads_win.h.
++ *
++ * SDL2 is bound at run time with GetProcAddress, so neither its headers nor
++ * an import library are needed to build, and a missing SDL2.dll only costs
++ * the non-Xbox pads. The few SDL2 types and constants used are declared here;
++ * they are SDL2's stable ABI (SDL_gamecontroller.h, SDL_joystick.h).
++ */
++#if defined(_WIN32)
++#include <windows.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "sdl_pads_win.h"
++#include "perf_log.h"
++
++/* ---- the SDL2 ABI subset ---- */
++typedef struct SDL_GameController SDL_GameController;
++typedef struct SDL_Joystick SDL_Joystick;
++typedef struct { unsigned char major, minor, patch; } SDL_version;
++
++#define SDL_INIT_JOYSTICK       0x00000200u
++#define SDL_INIT_GAMECONTROLLER 0x00002000u
++enum { B_A, B_B, B_X, B_Y, B_BACK, B_GUIDE, B_START, B_LSTICK, B_RSTICK,
++       B_LSHOULDER, B_RSHOULDER, B_UP, B_DOWN, B_LEFT, B_RIGHT };
++enum { A_LX, A_LY, A_RX, A_RY, A_LT, A_RT };
++enum { T_UNKNOWN, T_XBOX360, T_XBOXONE, T_PS3, T_PS4, T_SWITCH_PRO, T_VIRTUAL, T_PS5,
++       T_LUNA, T_STADIA, T_SHIELD, T_JOYCON_L, T_JOYCON_R, T_JOYCON_PAIR };
++
++static struct {
++    int         (*Init)(unsigned);
++    const char *(*GetError)(void);
++    int         (*SetHint)(const char *, const char *);
++    void        (*GetVersion)(SDL_version *);
++    void        (*PumpEvents)(void);
++    void        (*FlushEvents)(unsigned, unsigned);
++    int         (*NumJoysticks)(void);
++    int         (*IsGameController)(int);
++    int         (*JoystickGetDeviceInstanceID)(int);
++    const char *(*JoystickNameForIndex)(int);
++    SDL_GameController *(*GameControllerOpen)(int);
++    void        (*GameControllerClose)(SDL_GameController *);
++    int         (*GameControllerGetAttached)(SDL_GameController *);
++    unsigned char (*GameControllerGetButton)(SDL_GameController *, int);
++    short       (*GameControllerGetAxis)(SDL_GameController *, int);
++    const char *(*GameControllerName)(SDL_GameController *);
++    int         (*GameControllerGetType)(SDL_GameController *);
++    int         (*GameControllerRumble)(SDL_GameController *, unsigned short, unsigned short, unsigned);
++} S;
++
++typedef struct {
++    int                 used, id, ignored;   /* ignored: an Xbox pad, XInput's */
++    SDL_GameController *c;
++    SdlPadInfo          info;
++    XBOX_INPUT_STATE    st;
++    unsigned short      rumble_lo, rumble_hi, rumble_sent_lo, rumble_sent_hi;
++    DWORD               rumble_at;
++    unsigned            order;               /* connection order */
++} Pad;
++
++static Pad              s_pad[16];           /* more than SDLPADS_MAX: ignored ones too */
++static SRWLOCK          s_lock = SRWLOCK_INIT;
++static volatile LONG    s_started;           /* 0 no, 1 starting, 2 up, -1 failed */
++static unsigned         s_order;
++static HANDLE           s_ready;
++
++static const char *kind_name(int t)
++{
++    switch (t) {
++    case T_PS3: return "PS3";
++    case T_PS4: return "PS4";
++    case T_PS5: return "PS5";
++    case T_SWITCH_PRO: return "Switch Pro";
++    case T_JOYCON_L: case T_JOYCON_R: case T_JOYCON_PAIR: return "Joy-Con";
++    case T_VIRTUAL: return "virtual";
++    case T_LUNA: return "Luna";
++    case T_STADIA: return "Stadia";
++    case T_SHIELD: return "Shield";
++    case T_XBOX360: case T_XBOXONE: return "Xbox";
++    default: return "generic";
++    }
++}
++
++static int load_sdl(void)
++{
++    HMODULE m;
++    wchar_t path[MAX_PATH], *slash;
++    DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
++    /* Next to the exe first, not wherever the DLL search order finds one. */
++    if (n && n < MAX_PATH && (slash = wcsrchr(path, L'\\')) != NULL) {
++        wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"SDL2.dll");
++        m = LoadLibraryW(path);
++    } else {
++        m = NULL;
++    }
++    if (!m)
++        m = LoadLibraryW(L"SDL2.dll");
++    if (!m)
++        return 0;
++#define BIND(field, sym) do { *(FARPROC *)&S.field = GetProcAddress(m, sym); \
++                              if (!S.field) { fprintf(stderr, "[PAD] SDL2.dll lacks %s\n", sym); return 0; } } while (0)
++    BIND(Init, "SDL_Init");
++    BIND(GetError, "SDL_GetError");
++    BIND(SetHint, "SDL_SetHint");
++    BIND(GetVersion, "SDL_GetVersion");
++    BIND(PumpEvents, "SDL_PumpEvents");
++    BIND(FlushEvents, "SDL_FlushEvents");
++    BIND(NumJoysticks, "SDL_NumJoysticks");
++    BIND(IsGameController, "SDL_IsGameController");
++    BIND(JoystickGetDeviceInstanceID, "SDL_JoystickGetDeviceInstanceID");
++    BIND(JoystickNameForIndex, "SDL_JoystickNameForIndex");
++    BIND(GameControllerOpen, "SDL_GameControllerOpen");
++    BIND(GameControllerClose, "SDL_GameControllerClose");
++    BIND(GameControllerGetAttached, "SDL_GameControllerGetAttached");
++    BIND(GameControllerGetButton, "SDL_GameControllerGetButton");
++    BIND(GameControllerGetAxis, "SDL_GameControllerGetAxis");
++    BIND(GameControllerName, "SDL_GameControllerName");
++    BIND(GameControllerGetType, "SDL_GameControllerGetType");
++    BIND(GameControllerRumble, "SDL_GameControllerRumble");
++#undef BIND
++    return 1;
++}
++
++static Pad *find(int id)
++{
++    int i;
++    for (i = 0; i < (int)(sizeof s_pad / sizeof s_pad[0]); i++)
++        if (s_pad[i].used && s_pad[i].id == id)
++            return &s_pad[i];
++    return NULL;
++}
++
++/* SDL's controller state as an Xbox pad. Positional: the bottom face button
++ * is A whatever it is labelled (SDL_GAMECONTROLLER_USE_BUTTON_LABELS=0). */
++static void snapshot(Pad *p)
++{
++    SDL_GameController *c = p->c;
++    XBOX_INPUT_STATE s;
++    WORD btn = 0;
++    memset(&s, 0, sizeof s);
++    if (S.GameControllerGetButton(c, B_UP))     btn |= XBOX_GAMEPAD_DPAD_UP;
++    if (S.GameControllerGetButton(c, B_DOWN))   btn |= XBOX_GAMEPAD_DPAD_DOWN;
++    if (S.GameControllerGetButton(c, B_LEFT))   btn |= XBOX_GAMEPAD_DPAD_LEFT;
++    if (S.GameControllerGetButton(c, B_RIGHT))  btn |= XBOX_GAMEPAD_DPAD_RIGHT;
++    if (S.GameControllerGetButton(c, B_START))  btn |= XBOX_GAMEPAD_START;
++    if (S.GameControllerGetButton(c, B_BACK))   btn |= XBOX_GAMEPAD_BACK;
++    if (S.GameControllerGetButton(c, B_LSTICK)) btn |= XBOX_GAMEPAD_LEFT_THUMB;
++    if (S.GameControllerGetButton(c, B_RSTICK)) btn |= XBOX_GAMEPAD_RIGHT_THUMB;
++    s.Gamepad.wButtons = btn;
++    s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] = S.GameControllerGetButton(c, B_A) ? 255 : 0;
++    s.Gamepad.bAnalogButtons[XBOX_BUTTON_B] = S.GameControllerGetButton(c, B_B) ? 255 : 0;
++    s.Gamepad.bAnalogButtons[XBOX_BUTTON_X] = S.GameControllerGetButton(c, B_X) ? 255 : 0;
++    s.Gamepad.bAnalogButtons[XBOX_BUTTON_Y] = S.GameControllerGetButton(c, B_Y) ? 255 : 0;
++    s.Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] = S.GameControllerGetButton(c, B_LSHOULDER) ? 255 : 0;
++    s.Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] = S.GameControllerGetButton(c, B_RSHOULDER) ? 255 : 0;
++    /* SDL triggers are 0..32767 */
++    s.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = (BYTE)(S.GameControllerGetAxis(c, A_LT) >> 7);
++    s.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = (BYTE)(S.GameControllerGetAxis(c, A_RT) >> 7);
++    /* SDL's Y axes point down, the Xbox's up; -1 - v keeps -32768 in range. */
++    s.Gamepad.sThumbLX = S.GameControllerGetAxis(c, A_LX);
++    s.Gamepad.sThumbLY = (SHORT)(-1 - S.GameControllerGetAxis(c, A_LY));
++    s.Gamepad.sThumbRX = S.GameControllerGetAxis(c, A_RX);
++    s.Gamepad.sThumbRY = (SHORT)(-1 - S.GameControllerGetAxis(c, A_RY));
++    /* The packet number moves only when something changed, as XInput's. */
++    s.dwPacketNumber = p->st.dwPacketNumber;
++    if (memcmp(&s.Gamepad, &p->st.Gamepad, sizeof s.Gamepad))
++        s.dwPacketNumber++;
++    p->st = s;
++}
++
++static void scan(void)
++{
++    int n = S.NumJoysticks(), i;
++    for (i = 0; i < n; i++) {
++        int id = S.JoystickGetDeviceInstanceID(i);
++        Pad *p;
++        if (id < 0 || find(id))
++            continue;
++        AcquireSRWLockExclusive(&s_lock);
++        for (p = s_pad; p < s_pad + sizeof s_pad / sizeof s_pad[0] && p->used; p++)
++            ;
++        if (p == s_pad + sizeof s_pad / sizeof s_pad[0]) {
++            ReleaseSRWLockExclusive(&s_lock);
++            return;
++        }
++        memset(p, 0, sizeof *p);
++        p->used = 1;
++        p->id = id;
++        if (!S.IsGameController(i)) {
++            /* A joystick SDL has no controller mapping for: tell, once. */
++            const char *nm = S.JoystickNameForIndex(i);
++            p->ignored = 1;
++            ReleaseSRWLockExclusive(&s_lock);
++            fprintf(stderr, "[PAD] '%s' is not a known game controller (no mapping); ignored\n",
++                    nm ? nm : "?");
++            xbox_PerfNote("controller: '%s' not usable (SDL has no mapping for it)", nm ? nm : "?");
++            continue;
++        }
++        p->c = S.GameControllerOpen(i);
++        if (!p->c) {
++            p->ignored = 1;
++            ReleaseSRWLockExclusive(&s_lock);
++            fprintf(stderr, "[PAD] SDL could not open controller %d: %s\n", i, S.GetError());
++            continue;
++        }
++        {
++            const char *nm = S.GameControllerName(p->c);
++            int t = S.GameControllerGetType(p->c);
++            strncpy_s(p->info.name, sizeof p->info.name, nm ? nm : "controller", _TRUNCATE);
++            strncpy_s(p->info.kind, sizeof p->info.kind, kind_name(t), _TRUNCATE);
++            p->info.id = id;
++            p->order = ++s_order;
++            if (t == T_XBOX360 || t == T_XBOXONE) {
++                /* XInput reads these; opening both would make one pad two players. */
++                p->ignored = 1;
++                S.GameControllerClose(p->c);
++                p->c = NULL;
++            } else {
++                snapshot(p);
++            }
++            ReleaseSRWLockExclusive(&s_lock);
++            if (p->ignored)
++                fprintf(stderr, "[PAD] SDL sees '%s' (Xbox type): left to XInput\n", p->info.name);
++            else {
++                fprintf(stderr, "[PAD] SDL controller connected: '%s' (%s)\n", p->info.name, p->info.kind);
++                xbox_PerfNote("controller connected through SDL: '%s' (%s)", p->info.name, p->info.kind);
++            }
++        }
++    }
++}
++
++static void update(void)
++{
++    int i;
++    DWORD now = GetTickCount();
++    for (i = 0; i < (int)(sizeof s_pad / sizeof s_pad[0]); i++) {
++        Pad *p = &s_pad[i];
++        if (!p->used)
++            continue;
++        if (p->c && !S.GameControllerGetAttached(p->c)) {
++            char nm[64];
++            strncpy_s(nm, sizeof nm, p->info.name, _TRUNCATE);
++            AcquireSRWLockExclusive(&s_lock);
++            S.GameControllerClose(p->c);
++            memset(p, 0, sizeof *p);
++            ReleaseSRWLockExclusive(&s_lock);
++            fprintf(stderr, "[PAD] SDL controller disconnected: '%s'\n", nm);
++            xbox_PerfNote("controller disconnected: '%s'", nm);
++            continue;
++        }
++        if (!p->c)
++            continue;
++        AcquireSRWLockExclusive(&s_lock);
++        snapshot(p);
++        /* Rumble wants a duration: re-send changes, and refresh a running
++         * motor every 500 ms (the game sets it continuously). */
++        if (p->rumble_lo != p->rumble_sent_lo || p->rumble_hi != p->rumble_sent_hi
++            || ((p->rumble_lo || p->rumble_hi) && now - p->rumble_at > 500)) {
++            S.GameControllerRumble(p->c, p->rumble_lo, p->rumble_hi, 1000);
++            p->rumble_sent_lo = p->rumble_lo;
++            p->rumble_sent_hi = p->rumble_hi;
++            p->rumble_at = now;
++        }
++        ReleaseSRWLockExclusive(&s_lock);
++    }
++}
++
++/* Drop the records of joysticks SDL no longer lists (ignored ones have no
++ * controller handle to notice it by). */
++static void forget_missing(void)
++{
++    int n = S.NumJoysticks(), i, j;
++    for (i = 0; i < (int)(sizeof s_pad / sizeof s_pad[0]); i++) {
++        int seen = 0;
++        if (!s_pad[i].used || s_pad[i].c)
++            continue;
++        for (j = 0; j < n && !seen; j++)
++            seen = S.JoystickGetDeviceInstanceID(j) == s_pad[i].id;
++        if (!seen) {
++            AcquireSRWLockExclusive(&s_lock);
++            memset(&s_pad[i], 0, sizeof s_pad[i]);
++            ReleaseSRWLockExclusive(&s_lock);
++        }
++    }
++}
++
++static DWORD WINAPI pad_thread(LPVOID unused)
++{
++    SDL_version v;
++    unsigned tick = 0;
++    (void)unused;
++    /* Hints before SDL_Init. Background events: our window is not SDL's, so
++     * SDL never thinks it has focus. HIDAPI Xbox off: XInput owns Xbox pads.
++     * Raw input off: it would also claim Xbox pads. Positional buttons. */
++    S.SetHint("SDL_NO_SIGNAL_HANDLERS", "1");
++    S.SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
++    S.SetHint("SDL_JOYSTICK_HIDAPI_XBOX", "0");
++    S.SetHint("SDL_JOYSTICK_RAWINPUT", "0");
++    S.SetHint("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0");
++    if (S.Init(SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0) {
++        fprintf(stderr, "[PAD] SDL_Init failed: %s; only XInput controllers will work\n", S.GetError());
++        xbox_PerfNote("controllers: SDL failed to start (%s); only Xbox controllers work", S.GetError());
++        InterlockedExchange(&s_started, -1);
++        SetEvent(s_ready);
++        return 0;
++    }
++    S.GetVersion(&v);
++    fprintf(stderr, "[PAD] SDL %u.%u.%u up: non-Xbox controllers supported\n", v.major, v.minor, v.patch);
++    xbox_PerfNote("controllers: XInput + SDL %u.%u.%u", v.major, v.minor, v.patch);
++    S.PumpEvents();
++    scan();
++    InterlockedExchange(&s_started, 2);
++    SetEvent(s_ready);
++    for (;;) {
++        /* Pumping runs SDL's device detection and its helper window's
++         * messages (this thread created it); the event queue itself is not
++         * read, so it is emptied to stay small. */
++        S.PumpEvents();
++        S.FlushEvents(0, 0xFFFF);
++        if ((tick++ & 63) == 0) {          /* about 4 times a second */
++            scan();
++            forget_missing();
++        }
++        update();
++        Sleep(4);
++    }
++}
++
++int sdlpads_start(void)
++{
++    const char *e;
++    HANDLE th;
++    if (InterlockedCompareExchange(&s_started, 1, 0) != 0) {
++        if (s_started == 1 && s_ready)
++            WaitForSingleObject(s_ready, 3000);
++        return s_started == 2;
++    }
++    e = getenv("RECOMP_SDL_PADS");
++    if (e && *e == '0') {
++        fprintf(stderr, "[PAD] RECOMP_SDL_PADS=0: only XInput controllers\n");
++        InterlockedExchange(&s_started, -1);
++        return 0;
++    }
++    if (!load_sdl()) {
++        fprintf(stderr, "[PAD] SDL2.dll not found next to the exe: only XInput (Xbox) controllers will work\n");
++        xbox_PerfNote("controllers: SDL2.dll missing, only Xbox (XInput) controllers work");
++        InterlockedExchange(&s_started, -1);
++        return 0;
++    }
++    s_ready = CreateEventW(NULL, TRUE, FALSE, NULL);
++    th = CreateThread(NULL, 0, pad_thread, NULL, 0, NULL);
++    if (!th) {
++        InterlockedExchange(&s_started, -1);
++        return 0;
++    }
++    CloseHandle(th);
++    /* Pads present at startup should be there for the title's first poll. */
++    WaitForSingleObject(s_ready, 3000);
++    return s_started == 2;
++}
++
++int sdlpads_list(SdlPadInfo *out, int max)
++{
++    Pad *sorted[16];
++    int n = 0, i, j;
++    if (s_started != 2)
++        return 0;
++    AcquireSRWLockShared(&s_lock);
++    for (i = 0; i < (int)(sizeof s_pad / sizeof s_pad[0]); i++)
++        if (s_pad[i].used && s_pad[i].c && !s_pad[i].ignored)
++            sorted[n++] = &s_pad[i];
++    for (i = 1; i < n; i++)                  /* by connection order */
++        for (j = i; j > 0 && sorted[j - 1]->order > sorted[j]->order; j--) {
++            Pad *t = sorted[j]; sorted[j] = sorted[j - 1]; sorted[j - 1] = t;
++        }
++    if (n > max)
++        n = max;
++    for (i = 0; i < n; i++)
++        out[i] = sorted[i]->info;
++    ReleaseSRWLockShared(&s_lock);
++    return n;
++}
++
++int sdlpads_read(int id, XBOX_INPUT_STATE *st)
++{
++    Pad *p;
++    int ok = 0;
++    if (s_started != 2)
++        return 0;
++    AcquireSRWLockShared(&s_lock);
++    p = find(id);
++    if (p && p->c && !p->ignored) {
++        *st = p->st;
++        ok = 1;
++    }
++    ReleaseSRWLockShared(&s_lock);
++    return ok;
++}
++
++void sdlpads_rumble(int id, unsigned short low, unsigned short high)
++{
++    Pad *p;
++    if (s_started != 2)
++        return;
++    AcquireSRWLockExclusive(&s_lock);
++    p = find(id);
++    if (p) {
++        p->rumble_lo = low;
++        p->rumble_hi = high;
++    }
++    ReleaseSRWLockExclusive(&s_lock);
++}
++
++#endif /* _WIN32 */
+diff --git a/src/input/sdl_pads_win.h b/src/input/sdl_pads_win.h
+new file mode 100644
+index 0000000..a1435e0
+--- /dev/null
++++ b/src/input/sdl_pads_win.h
+@@ -0,0 +1,37 @@
++/*
++ * sdl_pads_win.h - non-XInput game controllers on Windows, through SDL2.
++ *
++ * XInput only sees Xbox-protocol pads. Switch Pro / 8BitDo (Switch and
++ * D-input modes), PlayStation and generic HID pads need SDL's drivers and
++ * its controller mapping database. SDL2.dll is loaded at run time (next to
++ * the exe); without it this reports nothing and only XInput pads work.
++ *
++ * One thread owns SDL: it initialises it, pumps its events, opens and closes
++ * controllers as they come and go, and publishes a snapshot of each one.
++ * Readers only copy snapshots, so the game's input thread never calls SDL.
++ * Pads SDL reports as Xbox controllers are left to XInput (no doubles).
++ */
++#ifndef SDL_PADS_WIN_H
++#define SDL_PADS_WIN_H
++#if defined(_WIN32)
++#include "xinput_xbox.h"
++
++#define SDLPADS_MAX 8
++
++typedef struct {
++    int  id;                /* SDL instance id: stable while connected */
++    char name[64];
++    char kind[32];          /* "Switch Pro", "PS4", "generic" ... */
++} SdlPadInfo;
++
++/* Starts the SDL thread if RECOMP_SDL_PADS is not 0 and SDL2.dll loads.
++ * Returns 1 when SDL is up. Safe to call more than once. */
++int  sdlpads_start(void);
++/* Connected pads in connection order; returns how many were written. */
++int  sdlpads_list(SdlPadInfo *out, int max);
++/* The pad's current state as an Xbox pad; 0 when it is gone. */
++int  sdlpads_read(int id, XBOX_INPUT_STATE *st);
++void sdlpads_rumble(int id, unsigned short low, unsigned short high);
++
++#endif
++#endif
+diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
+index 5975014..89ffce6 100644
+--- a/src/input/xinput_device.c
++++ b/src/input/xinput_device.c
+@@ -6,7 +6,7 @@
+  * (analog buttons as bytes, separate trigger channels) and the host
+  * (digital face buttons, trigger axes).
+  *
+- *   _WIN32 -> Windows XInput
++ *   _WIN32 -> Windows XInput, plus SDL2 (loaded at run time) for other pads
+  *   POSIX  -> SDL2 GameController
+  */
+ 
+@@ -50,37 +50,204 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
+ 
+ /* ======================================================================== */
+ #if defined(_WIN32)
+-/* ====================  XInput backend  ================================== */
++/* ============  Windows: XInput + SDL2 (non-Xbox pads)  ================== */
+ /* ======================================================================== */
+ 
++#include <stdio.h>
+ #include <xinput.h>
+ #pragma comment(lib, "xinput.lib")
++#include "sdl_pads_win.h"
++#include "perf_log.h"
+ 
+-static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
+-static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
++/* Which host controller plays as each Xbox port.
++ *
++ * It used to be "XInput slot N is port N". That breaks when the first pad
++ * Windows assigns lands in slot 1 (a virtual pad or a driver holding slot 0):
++ * the game then has a player 2 and no player 1. And pads XInput cannot see
++ * (8BitDo in Switch or D-input mode, PlayStation, Switch Pro) never played
++ * at all. Now every connected pad, XInput or SDL, takes the lowest free port
++ * when it arrives and keeps it until it is unplugged, so the first pad is
++ * player 1 whatever it is. Every change is logged with the pad's name. */
++enum { SRC_NONE, SRC_XINPUT, SRC_SDL };
++typedef struct { int kind, id; char name[64]; } PortSrc;
++
++static PortSrc          g_port[XBOX_MAX_CONTROLLERS];
++static BOOL             g_controller_connected[XBOX_MAX_CONTROLLERS];
++static CRITICAL_SECTION g_port_cs;
++static INIT_ONCE        g_port_once = INIT_ONCE_STATIC_INIT;
++
++static BOOL CALLBACK port_init_once(PINIT_ONCE o, PVOID p, PVOID *c)
++{
++    (void)o; (void)p; (void)c;
++    InitializeCriticalSection(&g_port_cs);
++    return TRUE;
++}
+ 
+-/* The keyboard on port 0 (RECOMP_KEYBOARD=1) comes from keyboard.c, shared
+- * with the SDL backend; the GDI window in fb_present.c records the keys. */
++static int port_of(int kind, int id)
++{
++    int i;
++    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
++        if (g_port[i].kind == kind && g_port[i].id == id)
++            return i;
++    return -1;
++}
+ 
+-void xbox_InputInit(void)
++static void port_attach(int kind, int id, const char *name)
++{
++    int i;
++    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
++        if (g_port[i].kind == SRC_NONE) {
++            g_port[i].kind = kind;
++            g_port[i].id = id;
++            strncpy_s(g_port[i].name, sizeof g_port[i].name, name, _TRUNCATE);
++            fprintf(stderr, "[PAD] player %d: %s\n", i + 1, name);
++            xbox_PerfNote("controller: player %d is %s", i + 1, name);
++            return;
++        }
++    fprintf(stderr, "[PAD] %s connected, but all %d players already have a controller\n",
++            name, XBOX_MAX_CONTROLLERS);
++}
++
++static void port_detach(int port)
+ {
+-    for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
+-        XINPUT_STATE state;
+-        DWORD result = XInputGetState(i, &state);
+-        g_controller_connected[i] = (result == ERROR_SUCCESS);
++    fprintf(stderr, "[PAD] player %d: controller removed (%s)\n", port + 1, g_port[port].name);
++    xbox_PerfNote("controller: player %d's %s removed", port + 1, g_port[port].name);
++    memset(&g_port[port], 0, sizeof g_port[port]);
++}
++
++/* Reconcile the ports with what is plugged in. Asking XInput about an
++ * empty slot can take milliseconds, so this runs on its own thread once a
++ * second, never on the game's input path (which used to poll every empty
++ * slot on every read), and the lock is held only to update the table. */
++static void port_scan(void)
++{
++    SdlPadInfo sp[SDLPADS_MAX];
++    int nsp, i, j, xconn[XBOX_MAX_CONTROLLERS];
++    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
++        XINPUT_STATE xs;
++        xconn[i] = XInputGetState((DWORD)i, &xs) == ERROR_SUCCESS;
++    }
++    nsp = sdlpads_list(sp, SDLPADS_MAX);
++    EnterCriticalSection(&g_port_cs);
++    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++) {       /* XInput slots */
++        int connected = xconn[i];
++        int port = port_of(SRC_XINPUT, i);
++        if (connected && port < 0) {
++            char nm[64];
++            _snprintf_s(nm, sizeof nm, _TRUNCATE, "Xbox controller (XInput slot %d)", i + 1);
++            port_attach(SRC_XINPUT, i, nm);
++        } else if (!connected && port >= 0) {
++            port_detach(port);
++        }
+     }
++    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++) {       /* SDL pads */
++        int still = 0;
++        if (g_port[i].kind != SRC_SDL)
++            continue;
++        for (j = 0; j < nsp && !still; j++)
++            still = sp[j].id == g_port[i].id;
++        if (!still)
++            port_detach(i);
++    }
++    for (j = 0; j < nsp; j++)
++        if (port_of(SRC_SDL, sp[j].id) < 0) {
++            char nm[64];
++            _snprintf_s(nm, sizeof nm, _TRUNCATE, "%s (%s)", sp[j].name, sp[j].kind);
++            port_attach(SRC_SDL, sp[j].id, nm);
++        }
++    LeaveCriticalSection(&g_port_cs);
++}
++
++static DWORD WINAPI port_thread(LPVOID unused)
++{
++    (void)unused;
++    for (;;) {
++        Sleep(1000);
++        port_scan();
++    }
++}
++
++static BOOL CALLBACK port_start_once(PINIT_ONCE o, PVOID p, PVOID *c)
++{
++    HANDLE th;
++    (void)o; (void)p; (void)c;
++    InitOnceExecuteOnce(&g_port_once, port_init_once, NULL, NULL);
++    sdlpads_start();
++    port_scan();                       /* pads present now play from the first read */
++    if (g_port[0].kind == SRC_NONE)
++        fprintf(stderr, "[PAD] no controller found at start (they can be plugged in any time)\n");
++    th = CreateThread(NULL, 0, port_thread, NULL, 0, NULL);
++    if (th)
++        CloseHandle(th);
++    return TRUE;
++}
++
++static INIT_ONCE g_start_once = INIT_ONCE_STATIC_INIT;
++
++static void port_maybe_scan(void)
++{
++    InitOnceExecuteOnce(&g_start_once, port_start_once, NULL, NULL);
++}
++
++void xbox_InputInit(void)
++{
++    port_maybe_scan();
++}
++
++static void from_xinput(const XINPUT_STATE *xi, XBOX_INPUT_STATE *pState)
++{
++    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
++    pState->dwPacketNumber = xi->dwPacketNumber;
++    pState->Gamepad.wButtons = xi->Gamepad.wButtons & 0x00FF;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
++        (xi->Gamepad.wButtons & XINPUT_GAMEPAD_A) ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
++        (xi->Gamepad.wButtons & XINPUT_GAMEPAD_B) ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
++        (xi->Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
++        (xi->Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
++        (xi->Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
++        (xi->Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi->Gamepad.bLeftTrigger;
++    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi->Gamepad.bRightTrigger;
++    pState->Gamepad.sThumbLX = xi->Gamepad.sThumbLX;
++    pState->Gamepad.sThumbLY = xi->Gamepad.sThumbLY;
++    pState->Gamepad.sThumbRX = xi->Gamepad.sThumbRX;
++    pState->Gamepad.sThumbRY = xi->Gamepad.sThumbRY;
+ }
+ 
+ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+ {
+-    XINPUT_STATE xi_state;
+-    DWORD result;
++    PortSrc src;
++    int ok = 0;
+ 
+     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+         return ERROR_DEVICE_NOT_CONNECTED;
+ 
+-    result = XInputGetState(dwPort, &xi_state);
+-    if (result != ERROR_SUCCESS) {
++    port_maybe_scan();
++    EnterCriticalSection(&g_port_cs);
++    src = g_port[dwPort];
++    LeaveCriticalSection(&g_port_cs);
++
++    if (src.kind == SRC_XINPUT) {
++        XINPUT_STATE xi;
++        if (XInputGetState((DWORD)src.id, &xi) == ERROR_SUCCESS) {
++            from_xinput(&xi, pState);
++            ok = 1;
++        } else {
++            EnterCriticalSection(&g_port_cs);
++            if (port_of(SRC_XINPUT, src.id) == (int)dwPort)
++                port_detach((int)dwPort);
++            LeaveCriticalSection(&g_port_cs);
++        }
++    } else if (src.kind == SRC_SDL) {
++        ok = sdlpads_read(src.id, pState);
++    }
++
++    if (!ok) {
+         g_controller_connected[dwPort] = FALSE;
+         if (dwPort == 0) {
+             /* Keyboard and mouse stand in for an absent pad, so the game is
+@@ -93,36 +260,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+             if (kb || mkb_enabled())
+                 return ERROR_SUCCESS;
+         }
+-        return result;
++        return ERROR_DEVICE_NOT_CONNECTED;
+     }
+ 
+     g_controller_connected[dwPort] = TRUE;
+-    g_last_packet[dwPort] = xi_state.dwPacketNumber;
+-
+-    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+-    pState->dwPacketNumber = xi_state.dwPacketNumber;
+-    pState->Gamepad.wButtons = xi_state.Gamepad.wButtons & 0x00FF;
+-
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_A) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_B) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
+-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
+-
+-    pState->Gamepad.sThumbLX = xi_state.Gamepad.sThumbLX;
+-    pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
+-    pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
+-    pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
+-
+     if (dwPort == 0)
+         keyboard_merge(pState);
+ 
+@@ -136,14 +277,25 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+ 
+ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+ {
+-    XINPUT_VIBRATION xi_vib;
++    PortSrc src;
+ 
+     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
+         return ERROR_DEVICE_NOT_CONNECTED;
+-
+-    xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
+-    xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
+-    return XInputSetState(dwPort, &xi_vib);
++    InitOnceExecuteOnce(&g_port_once, port_init_once, NULL, NULL);
++    EnterCriticalSection(&g_port_cs);
++    src = g_port[dwPort];
++    LeaveCriticalSection(&g_port_cs);
++    if (src.kind == SRC_XINPUT) {
++        XINPUT_VIBRATION xi_vib;
++        xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
++        xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
++        return XInputSetState((DWORD)src.id, &xi_vib);
++    }
++    if (src.kind == SRC_SDL) {
++        sdlpads_rumble(src.id, pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
++        return ERROR_SUCCESS;
++    }
++    return ERROR_DEVICE_NOT_CONNECTED;
+ }
+ 
+ BOOL xbox_InputIsConnected(DWORD dwPort)
+@@ -154,20 +306,31 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
+ 
+ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
+ {
+-    XINPUT_CAPABILITIES xi_caps;
+-    DWORD result;
++    PortSrc src;
+ 
+     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
+         return ERROR_DEVICE_NOT_CONNECTED;
+-
+-    result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
+-    if (result != ERROR_SUCCESS) return result;
+-
+-    memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
+-    pCaps->Type = xi_caps.Type;
+-    pCaps->SubType = xi_caps.SubType;
+-    pCaps->Flags = xi_caps.Flags;
+-    return ERROR_SUCCESS;
++    port_maybe_scan();
++    EnterCriticalSection(&g_port_cs);
++    src = g_port[dwPort];
++    LeaveCriticalSection(&g_port_cs);
++    if (src.kind == SRC_XINPUT) {
++        XINPUT_CAPABILITIES xi_caps;
++        DWORD result = XInputGetCapabilities((DWORD)src.id, dwFlags, &xi_caps);
++        if (result != ERROR_SUCCESS) return result;
++        memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
++        pCaps->Type = xi_caps.Type;
++        pCaps->SubType = xi_caps.SubType;
++        pCaps->Flags = xi_caps.Flags;
++        return ERROR_SUCCESS;
++    }
++    if (src.kind == SRC_SDL) {
++        memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
++        pCaps->Type    = 1;   /* XINPUT_DEVTYPE_GAMEPAD */
++        pCaps->SubType = 1;   /* XINPUT_DEVSUBTYPE_GAMEPAD */
++        return ERROR_SUCCESS;
++    }
++    return ERROR_DEVICE_NOT_CONNECTED;
+ }
+ 
+ /* ======================================================================== */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 10d00f4..aae1875 100644
+index 10d00f4..c964cfd 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
-@@ -2002,6 +2002,33 @@ static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
+@@ -30,6 +30,7 @@
+ #include "kernel_missing.h"
+ #include "xbox_memory_layout.h"
+ #include "platform/host_time.h"
++#include "platform/perf_log.h"
+ #include "recomp_icall_feedback.h"
+ #include <stdio.h>
+ /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
+@@ -2002,6 +2003,33 @@ static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
      return h;
  }
  
@@ -36,7 +865,118 @@ index 10d00f4..aae1875 100644
  /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
  static void bridge_KeSetEvent(void)
  {
-@@ -4756,7 +4783,9 @@ static void bridge_NtReadFile(void)
+@@ -3224,9 +3252,92 @@ static void kernel_vblank_raise(void)
+  * edge, 0 when vblanks are off. */
+ #define VBLANK_RESTART_NS 100000000ull
+ 
++/* Display-locked vblank (xbox_VblankDiscipline). The presenter reports each
++ * real display vblank; when the display runs at 60 Hz or a multiple of it,
++ * the schedule takes the display's period (times every-how-many refreshes)
++ * and its edges are steered a little each report until they sit just after
++ * a display vblank. Two free-running 60 Hz clocks -- this one and the
++ * monitor's -- drift against each other, and every time they slip a frame
++ * is shown twice or skipped: a stutter every few seconds that the frame
++ * rate never shows. With the schedule on the display's clock each game
++ * frame is presented once, right after a vblank, and shown for exactly the
++ * same number of refreshes. Without reports (GDI, a display the game cannot
++ * lock to, RECOMP_PACING=timer) the schedule is the fixed 60 Hz it was.
++ *
++ * Written by the presenter's display-clock thread, read by the timer thread:
++ * a sequence counter around the three fields (odd while writing). */
++#define VBLANK_DEFAULT_NS (1000000000.0 / 60.0)
++#define VBLANK_LOCK_OFFSET_NS 1500000ll    /* edges this long after the display's */
++static volatile LONG    g_disc_seq;
++static volatile int64_t g_disc_edge_ns, g_disc_disp_ns;
++static volatile LONG    g_disc_every;
++static double           s_vbl_period_ns = VBLANK_DEFAULT_NS;   /* timer thread only */
++static volatile LONG    g_lock_err_us;                          /* for the log */
++
++void xbox_VblankDiscipline(uint64_t edge_ns, uint64_t display_period_ns, int every)
++{
++    InterlockedIncrement(&g_disc_seq);
++    g_disc_edge_ns = (int64_t)edge_ns;
++    g_disc_disp_ns = (int64_t)display_period_ns;
++    g_disc_every = every;
++    InterlockedIncrement(&g_disc_seq);
++}
++
++/* The lock's phase error in microseconds (0 when not locked). */
++int xbox_VblankLockErrorUs(void)
++{
++    return (int)g_lock_err_us;
++}
++
+ static uint64_t vblank_due(uint64_t t0_ns, uint64_t n)
+ {
+-    return t0_ns + n * 1000000000ull / 60u;
++    return t0_ns + (uint64_t)((double)n * s_vbl_period_ns);
++}
++
++/* Apply the latest report to the schedule (t0, count). */
++static void vblank_discipline_apply(uint64_t *t0_ns, uint64_t *count)
++{
++    static LONG seen;
++    LONG s1 = g_disc_seq, s2;
++    int64_t edge, disp, target, next, err, adj, half;
++    int every;
++    double want;
++
++    if (s1 == seen || (s1 & 1))
++        return;
++    edge = g_disc_edge_ns;
++    disp = g_disc_disp_ns;
++    every = (int)g_disc_every;
++    s2 = g_disc_seq;
++    if (s1 != s2)
++        return;                                 /* torn: take the next one */
++    seen = s1;
++    want = (every > 0 && disp > 0) ? (double)disp * every : VBLANK_DEFAULT_NS;
++    if (want - s_vbl_period_ns > 500.0 || s_vbl_period_ns - want > 500.0) {
++        /* A new period: re-base at the next edge so nothing jumps. */
++        *t0_ns = vblank_due(*t0_ns, *count);
++        *count = 0;
++    }
++    s_vbl_period_ns = want;
++    if (every <= 0 || disp <= 0) {
++        g_lock_err_us = 0;
++        return;
++    }
++    /* Distance from the next edge to the nearest "display vblank + offset",
++     * on the display's grid, wrapped into +-half a refresh. */
++    target = edge + VBLANK_LOCK_OFFSET_NS;
++    next = (int64_t)vblank_due(*t0_ns, *count);
++    err = (target - next) % disp;
++    half = disp / 2;
++    if (err > half) err -= disp;
++    if (err < -half) err += disp;
++    g_lock_err_us = (LONG)(err / 1000);
++    /* Steer an eighth of the error per report, at most 0.2 ms: about a
++     * second to lock, and no visible change of game speed while it does. */
++    adj = err / 8;
++    if (adj > 200000) adj = 200000;
++    if (adj < -200000) adj = -200000;
++    *t0_ns = (uint64_t)((int64_t)*t0_ns + adj);
+ }
+ 
+ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
+@@ -3243,6 +3354,7 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
+         t0_ns = now_ns;
+         count = 0;
+     }
++    vblank_discipline_apply(&t0_ns, &count);
+     due = vblank_due(t0_ns, count);
+     if (now_ns < due) {
+         *next_due_ns = due;
+@@ -4255,6 +4367,8 @@ static NTSTATUS bridge_create_file_impl(
+             fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X\n",
+                     gpath, (unsigned)disposition, (unsigned)options,
+                     g_xbox_kernel_caller, status);
++        if (!status)
++            xbox_PerfFile(gpath);          /* shown on a hitch during the load */
+     }
+     fflush(stderr);
+     return st;
+@@ -4756,7 +4870,9 @@ static void bridge_NtReadFile(void)
           * whatever precedes the file it actually wants, and a read that stops
           * early looks identical to one that never started -- until you can
           * see where each one landed. */
@@ -47,6 +987,69 @@ index 10d00f4..aae1875 100644
              fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                      g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                      (long long)off.QuadPart, length, got,
+@@ -10840,10 +10956,15 @@ static void kernel_thunk_dispatch_body(void)
+     }
+ 
+     {
+-        static DWORD last_summary_tick = 0;
++        static volatile LONG last_summary_tick = 0;
+         DWORD now = GetTickCount();
+-        if (last_summary_tick == 0) last_summary_tick = now;
+-        if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
++        DWORD last = (DWORD)last_summary_tick;
++        if (last == 0) { InterlockedCompareExchange(&last_summary_tick, (LONG)now, 0); last = now; }
++        /* One thread prints it: several used to pass the time check at
++         * once and print it two or three times over, in a row. */
++        if (now - last >= 2000 && g_kernel_call_count > 200
++            && InterlockedCompareExchange(&last_summary_tick, (LONG)now, (LONG)last) == (LONG)last) {
++            uint64_t sum_t0 = xbox_HostNowNs();
+             fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
+                     g_kernel_call_count, ordinal, slot, g_esp);
+             /* And which ones, ranked. "Latest" names whatever the sample
+@@ -10869,7 +10990,11 @@ static void kernel_thunk_dispatch_body(void)
+                 }
+             }
+             fflush(stderr);
+-            last_summary_tick = now;
++            {
++                uint64_t sdt = xbox_HostNowNs() - sum_t0;
++                if (sdt > 2000000u)
++                    xbox_PerfNote("kernel summary print took %.1f ms", sdt / 1e6);
++            }
+         }
+     }
+ 
+@@ -10914,7 +11039,29 @@ static void kernel_thunk_dispatch_body(void)
+     }
+ 
+     if (bridge) {
+-        bridge();
++        /* With the performance log on, any kernel call that takes over 8 ms
++         * is written to it with its ordinal and guest call site: a stall
++         * inside the kernel layer (file system, a lock) is then named rather
++         * than only seen as a slow frame. Waits are slow on purpose and are
++         * left out. */
++        static int perf_on = -1;
++        if (perf_on < 0)
++            perf_on = xbox_PerfEnabled();
++        if (perf_on && ordinal != 99 && ordinal != 158 && ordinal != 159 && ordinal != 233
++            && ordinal != 234 && ordinal != 235 && ordinal != 238) {
++            uint64_t t0 = xbox_HostNowNs(), dt;
++            uint32_t caller = g_xbox_kernel_caller;
++            bridge();
++            dt = xbox_HostNowNs() - t0;
++            if (dt > 8000000u) {
++                static volatile LONG said;
++                if (InterlockedIncrement(&said) <= 300)
++                    xbox_PerfNote("slow kernel call: ordinal %u took %.1f ms (guest caller 0x%08X, thread %lu)",
++                                  ordinal, dt / 1e6, caller, (unsigned long)GetCurrentThreadId());
++            }
++        } else {
++            bridge();
++        }
+     } else {
+         /* No specific bridge - return 0. Warn once per ordinal rather than
+          * gating on g_kernel_call_count: a missing bridge is rare and is
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
 index 2651871..a357961 100644
 --- a/src/kernel/kernel_file.c
@@ -1052,6 +2055,503 @@ index b723a92..1f46cb7 100644
  void xbox_PhysNoteRamName(uint32_t va)
  {
      if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
+diff --git a/src/platform/CMakeLists.txt b/src/platform/CMakeLists.txt
+index 334a9ed..67aa407 100644
+--- a/src/platform/CMakeLists.txt
++++ b/src/platform/CMakeLists.txt
+@@ -30,7 +30,7 @@ target_include_directories(recomp_exit_hook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+ # host_time: the host's monotonic clock and the timer thread's sleep
+ # (host_time.h). A real library on every host, carried by platform to every
+ # library of the runtime.
+-add_library(host_time STATIC host_time.c)
++add_library(host_time STATIC host_time.c perf_log.c)
+ target_include_directories(host_time PUBLIC
+     ${XBOXRECOMP_SRC_DIR}
+     ${CMAKE_CURRENT_SOURCE_DIR}
+diff --git a/src/platform/perf_log.c b/src/platform/perf_log.c
+new file mode 100644
+index 0000000..6568c5b
+--- /dev/null
++++ b/src/platform/perf_log.c
+@@ -0,0 +1,405 @@
++/*
++ * perf_log.c - see perf_log.h.
++ */
++#include "perf_log.h"
++
++#ifdef _WIN32
++#include <windows.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "host_time.h"
++
++#define HIST_MAX     8          /* "shown for N refreshes" buckets, N = 1..8 */
++#define RECENT       32         /* frame intervals the hitch rule compares to */
++#define FILES_KEPT   4
++#define HITCH_LINES  20         /* per 5 s summary period; the rest are counted */
++#define SUMMARY_NS   5000000000ull
++
++static CRITICAL_SECTION s_cs;
++static volatile LONG    s_state;            /* 0 unknown, 1 on, -1 off */
++static FILE            *s_f;
++static uint64_t         s_t0;               /* xbox_HostNowNs at init */
++
++/* The game frame in progress. */
++static double   s_cnt[XBOX_PERF_COUNTERS];
++static char     s_files[FILES_KEPT][96];
++static int      s_nfiles, s_files_dropped;
++static uint64_t s_last_flip, s_frames;
++static double   s_recent[RECENT];
++static int      s_nrecent, s_recent_pos;
++
++/* The summary period. */
++static struct {
++    uint64_t start, frames, hitches, hitch_lines, judders, shown[HIST_MAX + 1];
++    double   min_ms, max_ms, shaders, shader_ms, shaders_async, tex, tex_bytes;
++} s_per;
++
++/* Whole run. */
++static uint64_t s_tot_hitches, s_tot_judders;
++static double   s_worst_ms;
++static uint64_t s_worst_frame;
++static int      s_marks;
++
++/* Display, as last reported. */
++static double s_hz, s_phase_ms;
++static int    s_locked, s_every;
++static char   s_presenter[64];
++
++static double secs(uint64_t now) { return (double)(now - s_t0) / 1e9; }
++
++static void stamp(char *b, size_t n, uint64_t now)
++{
++    SYSTEMTIME st;
++    GetLocalTime(&st);
++    _snprintf_s(b, n, _TRUNCATE, "%02u:%02u:%02u t=%8.2fs", st.wHour, st.wMinute,
++                st.wSecond, secs(now));
++}
++
++static void line_locked(uint64_t now, const char *fmt, va_list ap)
++{
++    char ts[48];
++    if (!s_f)
++        return;
++    stamp(ts, sizeof ts, now);
++    fprintf(s_f, "[%s] ", ts);
++    vfprintf(s_f, fmt, ap);
++    fputc('\n', s_f);
++    fflush(s_f);
++}
++
++static void line(uint64_t now, const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++    line_locked(now, fmt, ap);
++    va_end(ap);
++}
++
++static void reg_string(HKEY root, const char *key, const char *val, char *out, DWORD n)
++{
++    HKEY h;
++    out[0] = 0;
++    if (RegOpenKeyExA(root, key, 0, KEY_READ, &h) == ERROR_SUCCESS) {
++        DWORD type, sz = n - 1;
++        if (RegQueryValueExA(h, val, NULL, &type, (BYTE *)out, &sz) == ERROR_SUCCESS
++            && type == REG_SZ)
++            out[sz < n ? sz : n - 1] = 0;
++        else
++            out[0] = 0;
++        RegCloseKey(h);
++    }
++}
++
++static void header(void)
++{
++    char cpu[128], prod[128], build[32], exe[MAX_PATH];
++    SYSTEMTIME st;
++    MEMORYSTATUSEX ms;
++    LPCH env;
++
++    GetLocalTime(&st);
++    fprintf(s_f, "==== performance log, %04u-%02u-%02u %02u:%02u:%02u ====\n",
++            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
++    if (GetModuleFileNameA(NULL, exe, sizeof exe))
++        fprintf(s_f, "exe:     %s\n", exe);
++    reg_string(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
++               "ProductName", prod, sizeof prod);
++    reg_string(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
++               "CurrentBuild", build, sizeof build);
++    fprintf(s_f, "windows: %s (build %s)\n", prod[0] ? prod : "?", build[0] ? build : "?");
++    reg_string(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
++               "ProcessorNameString", cpu, sizeof cpu);
++    fprintf(s_f, "cpu:     %s (%lu logical)\n", cpu[0] ? cpu : "?",
++            (unsigned long)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
++    ms.dwLength = sizeof ms;
++    if (GlobalMemoryStatusEx(&ms))
++        fprintf(s_f, "memory:  %.1f GB\n", (double)ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0));
++    fprintf(s_f, "settings:");
++    env = GetEnvironmentStringsA();
++    if (env) {
++        const char *p;
++        int any = 0;
++        for (p = env; *p; p += strlen(p) + 1)
++            if (!strncmp(p, "RECOMP_", 7) || !strncmp(p, "HITZ_", 5)) {
++                fprintf(s_f, "%s %s", any ? "," : "", p);
++                any = 1;
++            }
++        if (!any)
++            fprintf(s_f, " (none)");
++        FreeEnvironmentStringsA(env);
++    }
++    fprintf(s_f, "\n");
++    fprintf(s_f, "How to read: HITCH = a game frame that took much longer than the ones\n"
++                 "around it (and what happened during it); JUDDER = a frame stayed on screen\n"
++                 "longer or shorter than the steady cadence; MARK = F9 pressed. Times are\n"
++                 "wall clock and seconds since start.\n\n");
++    fflush(s_f);
++}
++
++void xbox_PerfInit(void)
++{
++    const char *e, *name;
++    if (InterlockedCompareExchange(&s_state, -1, 0) != 0)
++        return;                                 /* already decided */
++    e = getenv("RECOMP_PERF_LOG");
++    if (!e || !*e || *e == '0')
++        return;                                 /* stays -1: off */
++    name = getenv("RECOMP_PERF_LOG_FILE");
++    if (!name || !*name)
++        name = "perf.log";
++    if (fopen_s(&s_f, name, "w") != 0 || !s_f) {
++        fprintf(stderr, "[PERF] cannot write %s; no performance log\n", name);
++        return;
++    }
++    InitializeCriticalSection(&s_cs);
++    s_t0 = xbox_HostNowNs();
++    s_per.start = s_t0;
++    s_per.min_ms = 1e9;
++    header();
++    fprintf(stderr, "[PERF] performance log: %s (F9 adds a mark)\n", name);
++    InterlockedExchange(&s_state, 1);
++}
++
++int xbox_PerfEnabled(void)
++{
++    if (s_state == 0)
++        xbox_PerfInit();
++    return s_state > 0;
++}
++
++void xbox_PerfNote(const char *fmt, ...)
++{
++    va_list ap;
++    if (!xbox_PerfEnabled())
++        return;
++    EnterCriticalSection(&s_cs);
++    va_start(ap, fmt);
++    line_locked(xbox_HostNowNs(), fmt, ap);
++    va_end(ap);
++    LeaveCriticalSection(&s_cs);
++}
++
++void xbox_PerfCount(int counter, double amount)
++{
++    if (counter < 0 || counter >= XBOX_PERF_COUNTERS || !xbox_PerfEnabled())
++        return;
++    EnterCriticalSection(&s_cs);
++    s_cnt[counter] += amount;
++    LeaveCriticalSection(&s_cs);
++}
++
++void xbox_PerfFile(const char *path)
++{
++    const char *p;
++    if (!path || !xbox_PerfEnabled())
++        return;
++    p = path + strlen(path);                     /* keep the tail of long paths */
++    if (p - path > 90)
++        path = p - 90;
++    EnterCriticalSection(&s_cs);
++    if (s_nfiles < FILES_KEPT)
++        strncpy_s(s_files[s_nfiles++], sizeof s_files[0], path, _TRUNCATE);
++    else
++        s_files_dropped++;
++    LeaveCriticalSection(&s_cs);
++}
++
++static double median_recent(void)
++{
++    double v[RECENT];
++    int n = s_nrecent, i, j;
++    for (i = 0; i < n; i++)
++        v[i] = s_recent[i];
++    for (i = 1; i < n; i++) {                   /* n <= 32: insertion sort */
++        double x = v[i];
++        for (j = i - 1; j >= 0 && v[j] > x; j--)
++            v[j + 1] = v[j];
++        v[j + 1] = x;
++    }
++    return n ? v[n / 2] : 0.0;
++}
++
++static void summary_locked(uint64_t now)
++{
++    double sec = (double)(now - s_per.start) / 1e9;
++    char hist[96] = "", lock[48];
++    int i, o = 0;
++    if (!s_locked)
++        _snprintf_s(lock, sizeof lock, _TRUNCATE, "free-running");
++    else if (s_every > 1)
++        _snprintf_s(lock, sizeof lock, _TRUNCATE, "locked, every %d refreshes, phase %+.1f ms",
++                    s_every, s_phase_ms);
++    else
++        _snprintf_s(lock, sizeof lock, _TRUNCATE, "locked, phase %+.1f ms", s_phase_ms);
++    for (i = 1; i <= HIST_MAX; i++)
++        if (s_per.shown[i])
++            o += _snprintf_s(hist + o, sizeof hist - o, _TRUNCATE, "%s%dx:%llu",
++                             o ? " " : "", i, (unsigned long long)s_per.shown[i]);
++    line(now, "%5.1f fps | frame %.1f-%.1f ms | hitches %llu | display %.2f Hz %s | "
++              "shown %s | shaders %.0f (%.0f ms)%s | textures %.0f (%.1f MB)",
++         sec > 0 ? (double)s_per.frames / sec : 0.0,
++         s_per.frames ? s_per.min_ms : 0.0, s_per.frames ? s_per.max_ms : 0.0,
++         (unsigned long long)s_per.hitches, s_hz, lock,
++         o ? hist : "-", s_per.shaders, s_per.shader_ms,
++         s_per.shaders_async > 0 ? " +bg" : "", s_per.tex, s_per.tex_bytes / 1048576.0);
++    if (s_per.hitch_lines > HITCH_LINES)
++        line(now, "  (%llu more hitches in this period not listed)",
++             (unsigned long long)(s_per.hitch_lines - HITCH_LINES));
++    memset(&s_per, 0, sizeof s_per);
++    s_per.start = now;
++    s_per.min_ms = 1e9;
++}
++
++void xbox_PerfFlip(void)
++{
++    uint64_t now;
++    double ms;
++    if (!xbox_PerfEnabled())
++        return;
++    now = xbox_HostNowNs();
++    EnterCriticalSection(&s_cs);
++    if (s_last_flip) {
++        ms = (double)(now - s_last_flip) / 1e6;
++        s_frames++;
++        s_per.frames++;
++        if (ms < s_per.min_ms) s_per.min_ms = ms;
++        if (ms > s_per.max_ms) s_per.max_ms = ms;
++        s_per.shaders += s_cnt[XBOX_PERF_SHADERS];
++        s_per.shader_ms += s_cnt[XBOX_PERF_SHADER_MS];
++        s_per.shaders_async += s_cnt[XBOX_PERF_SHADERS_ASYNC];
++        s_per.tex += s_cnt[XBOX_PERF_TEXTURES];
++        s_per.tex_bytes += s_cnt[XBOX_PERF_TEX_BYTES];
++        /* A hitch: clearly longer than the recent steady cadence (so a menu
++         * that runs at 30 fps on purpose is not a hitch every frame), and
++         * longer than a 60 Hz frame and a half in any case. */
++        if (s_nrecent >= 8) {
++            double med = median_recent();
++            if (ms > 25.0 && ms > med * 1.5) {
++                s_per.hitches++;
++                s_tot_hitches++;
++                if (++s_per.hitch_lines <= HITCH_LINES) {
++                    char files[FILES_KEPT * 100 + 32] = "";
++                    int i, o = 0;
++                    for (i = 0; i < s_nfiles; i++)
++                        o += _snprintf_s(files + o, sizeof files - o, _TRUNCATE, "%s%s",
++                                         i ? ", " : "", s_files[i]);
++                    if (s_files_dropped)
++                        _snprintf_s(files + o, sizeof files - o, _TRUNCATE, " +%d more",
++                                    s_files_dropped);
++                    line(now, "HITCH frame %llu took %.1f ms (usual %.1f) | shaders %.0f (%.1f ms) "
++                              "| textures %.0f (%.1f MB)%s%s",
++                         (unsigned long long)s_frames, ms, med, s_cnt[XBOX_PERF_SHADERS],
++                         s_cnt[XBOX_PERF_SHADER_MS], s_cnt[XBOX_PERF_TEXTURES],
++                         s_cnt[XBOX_PERF_TEX_BYTES] / 1048576.0,
++                         s_nfiles ? " | files: " : "", files);
++                }
++                if (ms > s_worst_ms) {
++                    s_worst_ms = ms;
++                    s_worst_frame = s_frames;
++                }
++            }
++        }
++        s_recent[s_recent_pos] = ms;
++        s_recent_pos = (s_recent_pos + 1) % RECENT;
++        if (s_nrecent < RECENT)
++            s_nrecent++;
++    }
++    s_last_flip = now;
++    memset(s_cnt, 0, sizeof s_cnt);
++    s_nfiles = s_files_dropped = 0;
++    if (now - s_per.start >= SUMMARY_NS)
++        summary_locked(now);
++    LeaveCriticalSection(&s_cs);
++}
++
++void xbox_PerfShown(uint32_t refreshes, uint32_t expected)
++{
++    if (!xbox_PerfEnabled() || !refreshes)
++        return;
++    EnterCriticalSection(&s_cs);
++    s_per.shown[refreshes > HIST_MAX ? HIST_MAX : refreshes]++;
++    if (expected && refreshes != expected) {
++        s_per.judders++;
++        s_tot_judders++;
++        if (s_per.judders <= 5)
++            line(xbox_HostNowNs(), "JUDDER a frame stayed on screen for %u refresh%s (steady: %u)",
++                 refreshes, refreshes == 1 ? "" : "es", expected);
++    }
++    LeaveCriticalSection(&s_cs);
++}
++
++void xbox_PerfDisplay(double hz, int locked, int every, double phase_err_ms,
++                      const char *presenter)
++{
++    if (!xbox_PerfEnabled())
++        return;
++    EnterCriticalSection(&s_cs);
++    if ((locked != s_locked || every != s_every || (s_hz > 0 && (hz - s_hz > 1.0 || s_hz - hz > 1.0))
++         || (presenter && strcmp(presenter, s_presenter)))
++        && hz > 0)
++        line(xbox_HostNowNs(), "display: %.2f Hz, %s%s%s", hz,
++             locked ? "game frames locked to the display" : "game frames on their own timer",
++             presenter ? ", " : "", presenter ? presenter : "");
++    s_hz = hz;
++    s_locked = locked;
++    s_every = every;
++    s_phase_ms = phase_err_ms;
++    if (presenter)
++        strncpy_s(s_presenter, sizeof s_presenter, presenter, _TRUNCATE);
++    LeaveCriticalSection(&s_cs);
++}
++
++int xbox_PerfMark(void)
++{
++    int n;
++    double med;
++    if (!xbox_PerfEnabled())
++        return 0;
++    EnterCriticalSection(&s_cs);
++    n = ++s_marks;
++    med = median_recent();
++    line(xbox_HostNowNs(), "*** MARK %d (F9) *** recent frames: usual %.1f ms, this period so far: "
++                           "%llu frames, %llu hitches, worst %.1f ms",
++         n, med, (unsigned long long)s_per.frames, (unsigned long long)s_per.hitches,
++         s_per.frames ? s_per.max_ms : 0.0);
++    LeaveCriticalSection(&s_cs);
++    return n;
++}
++
++void xbox_PerfShutdown(const char *why)
++{
++    if (s_state <= 0)
++        return;
++    EnterCriticalSection(&s_cs);
++    if (s_f) {
++        uint64_t now = xbox_HostNowNs();
++        summary_locked(now);
++        line(now, "end (%s): %llu frames, %llu hitches (worst %.1f ms at frame %llu), "
++                  "%llu judders, %d marks",
++             why ? why : "exit", (unsigned long long)s_frames,
++             (unsigned long long)s_tot_hitches, s_worst_ms,
++             (unsigned long long)s_worst_frame, (unsigned long long)s_tot_judders, s_marks);
++        fclose(s_f);
++        s_f = NULL;
++    }
++    InterlockedExchange(&s_state, -1);
++    LeaveCriticalSection(&s_cs);
++}
++
++#else /* !_WIN32: the log is Windows-only for now */
++
++void xbox_PerfInit(void) {}
++int  xbox_PerfEnabled(void) { return 0; }
++void xbox_PerfNote(const char *fmt, ...) { (void)fmt; }
++void xbox_PerfCount(int counter, double amount) { (void)counter; (void)amount; }
++void xbox_PerfFile(const char *path) { (void)path; }
++void xbox_PerfFlip(void) {}
++void xbox_PerfShown(uint32_t refreshes, uint32_t expected) { (void)refreshes; (void)expected; }
++void xbox_PerfDisplay(double hz, int locked, int every, double phase_err_ms, const char *presenter)
++{ (void)hz; (void)locked; (void)every; (void)phase_err_ms; (void)presenter; }
++int  xbox_PerfMark(void) { return 0; }
++void xbox_PerfShutdown(const char *why) { (void)why; }
++
++#endif
+diff --git a/src/platform/perf_log.h b/src/platform/perf_log.h
+new file mode 100644
+index 0000000..4e56aef
+--- /dev/null
++++ b/src/platform/perf_log.h
+@@ -0,0 +1,67 @@
++/*
++ * perf_log.h - a human-readable timing log for chasing stutter.
++ *
++ * One file (RECOMP_PERF_LOG_FILE, default "perf.log" in the working
++ * directory), written only when RECOMP_PERF_LOG=1. It answers "why did that
++ * moment feel laggy" after the fact:
++ *
++ *   - a header with the machine, the display and the settings in effect;
++ *   - a HITCH line for every game frame that took clearly longer than the
++ *     ones around it, with what happened during it (shaders compiled,
++ *     textures uploaded, game files opened);
++ *   - a JUDDER line when the presenter saw a frame stay on screen for a
++ *     different number of display refreshes than the steady cadence;
++ *   - a summary every 5 s (frame rate, frame-time range, display rate and
++ *     pacing state);
++ *   - a MARK line each time the player presses F9, so "it stuttered just
++ *     now" can be found in the file by its wall-clock time.
++ *
++ * Every call is cheap and thread-safe; all of them do nothing while the log
++ * is off. Each line is flushed as it is written, so a crash keeps the tail.
++ */
++#ifndef XBOX_PERF_LOG_H
++#define XBOX_PERF_LOG_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Per-frame counters, reset at each game frame (xbox_PerfFlip). */
++enum {
++    XBOX_PERF_SHADERS = 0,      /* shaders compiled on the render thread */
++    XBOX_PERF_SHADER_MS,        /* ... and the milliseconds that took */
++    XBOX_PERF_SHADERS_ASYNC,    /* shaders handed to the background compiler */
++    XBOX_PERF_TEXTURES,         /* textures uploaded */
++    XBOX_PERF_TEX_BYTES,        /* ... and their size */
++    XBOX_PERF_COUNTERS
++};
++
++void xbox_PerfInit(void);
++int  xbox_PerfEnabled(void);
++/* A free-form line, prefixed with the time. */
++void xbox_PerfNote(const char *fmt, ...);
++void xbox_PerfCount(int counter, double amount);
++/* A game file was opened (shown on a hitch that happened during it). */
++void xbox_PerfFile(const char *path);
++/* The title flipped: one game frame ended. */
++void xbox_PerfFlip(void);
++/* The presenter's view: the previous frame stayed on screen for `refreshes`
++ * display refreshes; `expected` is the steady value (0 when there is none,
++ * e.g. a 144 Hz display showing 60 fps). */
++void xbox_PerfShown(uint32_t refreshes, uint32_t expected);
++/* Display state, for the summaries: refresh rate, whether the game's frame
++ * clock is locked to it (and every how many refreshes), the lock's phase
++ * error, and a short description of the presenter. */
++void xbox_PerfDisplay(double hz, int locked, int every, double phase_err_ms,
++                      const char *presenter);
++/* F9: returns the mark's number (shown in the window title), 0 when off. */
++int  xbox_PerfMark(void);
++void xbox_PerfShutdown(const char *why);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
 diff --git a/src/usb/ohci.c b/src/usb/ohci.c
 index efa5046..16f2a17 100644
 --- a/src/usb/ohci.c
@@ -1133,6 +2633,678 @@ index bd00f3f..5f92255 100644
      XBOX_INPUT_STATE state;
      const XBOX_GAMEPAD *g;
      uint8_t synth = synthetic_buttons();
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index 3430107..3864691 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -28,6 +28,7 @@
+ #include <windows.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include "platform/perf_log.h"
+ #include <string.h>
+ /* Which keys are down, for the pad stand-in in src/input: this window
+  * records them in the shared key table (src/input/keyboard.c).
+@@ -63,6 +64,11 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
+  * thread is never reading the one being filled. */
+ static uint32_t     *s_present[2];
+ static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
++static HANDLE        s_new_frame;    /* set by each flip (auto-reset) */
++static volatile LONG s_resized;      /* re-present: the client area changed */
++static int           s_mark_n;       /* last F9 mark, shown in the title */
++static DWORD         s_mark_until;
++static volatile LONG s_title_now;    /* refresh the title at once */
+ 
+ /* The last PVIDEO frame shown. A frame stays on screen until the next one or
+  * STOP, but once its bank is consumed the title may reuse the memory, so the
+@@ -198,6 +204,9 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+     }
+     /* Published only once it is whole. */
+     InterlockedExchange(&s_present_idx, next);
++    if (s_new_frame)
++        SetEvent(s_new_frame);          /* the window presents it once, now */
++    xbox_PerfFlip();
+ }
+ 
+ /* Title bar, the way ps3recomp's window shows it. Written by the flip,
+@@ -242,7 +251,11 @@ static void fb_toggle_fullscreen(HWND h)
+                      mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                      SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+         full = 1;
++        if (gpu_present_active())
++            gpu_present_fullscreen(1);
+     } else {
++        if (gpu_present_active())
++            gpu_present_fullscreen(0);
+         SetWindowLongPtrA(h, GWL_STYLE, saved_style);
+         SetWindowPos(h, NULL, saved.left, saved.top, saved.right - saved.left,
+                      saved.bottom - saved.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW);
+@@ -261,6 +274,18 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+     }
+     if (m == WM_SYSKEYDOWN && w == VK_RETURN)
+         return 0;                       /* auto-repeat of Alt+Enter */
++    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30))) {
++        /* A mark in the performance log: "it stuttered just now". */
++        int n = xbox_PerfMark();
++        if (n) {
++            s_mark_n = n;
++            s_mark_until = GetTickCount() + 3000;
++            InterlockedExchange(&s_title_now, 1);
++        }
++        return 0;
++    }
++    if (m == WM_SIZE)
++        InterlockedExchange(&s_resized, 1);
+     switch (m) {
+     case WM_CLOSE:
+     case WM_DESTROY:
+@@ -275,6 +300,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+         InterlockedExchange(&s_fb_running, 0);
+         if (!getenv("RECOMP_CLOSE_KEEPS_RUNNING")) {
+             fprintf(stderr, "  [FBWIN] window closed: exiting\n");
++            xbox_PerfShutdown("window closed");
+             recomp_exit_hook_run("window");
+             fflush(stdout);
+             fflush(stderr);
+@@ -543,17 +569,39 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+ 
+     fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
+             s_fb_width, s_fb_height);
+-    if (gpu_present_enabled())
+-        gpu_present_init(hwnd, s_fb_width, s_fb_height);
++    if (gpu_present_enabled() && gpu_present_init(hwnd, s_fb_width, s_fb_height)) {
++        const char *fs = getenv("RECOMP_FULLSCREEN");
++        if (fs && *fs && *fs != '0')
++            gpu_present_fullscreen(1);  /* it went fullscreen before the presenter existed */
++    }
+ 
+     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
+         MSG msg;
+-        int paced = 0;
++        int paced = 0, show = 1;
++        if (gpu_present_active() && s_new_frame) {
++            /* Each game frame is presented once, as soon as the title flips
++             * it (the flip lands just after a display vblank when the frame
++             * clock is locked to the display, so the present makes the next
++             * one). Re-presenting the newest frame at every refresh instead
++             * showed some frames one refresh more than others whenever a
++             * flip and a refresh came close together. Without flips for a
++             * while (movies, a stalled title) it falls back to presenting at
++             * the display's rate as before. */
++            static DWORD last_flip;
++            DWORD r = MsgWaitForMultipleObjects(1, &s_new_frame, FALSE, 20, QS_ALLINPUT);
++            DWORD now = GetTickCount();
++            if (r == WAIT_OBJECT_0)
++                last_flip = now;
++            show = r == WAIT_OBJECT_0 || now - last_flip > 100
++                || InterlockedExchange(&s_resized, 0);
++        }
+         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+             TranslateMessage(&msg);
+             DispatchMessageA(&msg);
+         }
+-        if (s_present_idx >= 0 && s_rgb) {
++        if (!show) {
++            paced = 1;                  /* waited above; nothing new to show */
++        } else if (s_present_idx >= 0 && s_rgb) {
+             /* A finished frame, published by the flip. Copied into s_rgb so
+              * the dump path and GDI see one consistent image even if the
+              * next flip lands mid-blit. */
+@@ -601,13 +649,19 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+             static DWORD t0;
+             static LONG f0;
+             DWORD now = GetTickCount();
+-            if (now - t0 >= 1000) {
++            if (now - t0 >= 1000 || InterlockedExchange(&s_title_now, 0)) {
+                 LONG f = s_flips;
+                 wchar_t tb[128];
+                 _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
+                            t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
+                            (long)s_frame_draws);
+                 tb[127] = 0;
++                if (s_mark_n && (int)(s_mark_until - now) > 0) {
++                    size_t l = wcslen(tb);
++                    _snwprintf(tb + l, (sizeof tb / sizeof tb[0]) - 1 - l,
++                               L" | F9 mark %d saved", s_mark_n);
++                    tb[sizeof tb / sizeof tb[0] - 1] = 0;
++                }
+                 SetWindowTextW(hwnd, tb);
+                 t0 = now; f0 = f;
+             }
+@@ -634,6 +688,9 @@ void xbox_FramebufferWindowStart(void)
+         return;
+     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
+         return;
++    xbox_PerfInit();
++    if (!s_new_frame)
++        s_new_frame = CreateEventW(NULL, FALSE, FALSE, NULL);
+     th = CreateThread(NULL, 0, fb_thread, NULL, 0, NULL);
+     if (th)
+         CloseHandle(th);
+diff --git a/src/video/gpu_present.c b/src/video/gpu_present.c
+index 4e122b1..5a0b4eb 100644
+--- a/src/video/gpu_present.c
++++ b/src/video/gpu_present.c
+@@ -3,11 +3,31 @@
+  *
+  * GDI shows each frame with StretchDIBits on a 16 ms timer, scaled on the
+  * CPU. This puts a D3D11 device and a swap chain on the same window and
+- * presents the flipped frame through it, vsync-paced. The frame (the guest's
+- * A8R8G8B8, i.e. B8G8R8A8 in memory order) is uploaded into its own texture
+- * and drawn into a back buffer the size of the window's client area,
+- * letterboxed to the frame's aspect ratio on black -- the window can be any
+- * size (or borderless fullscreen) without stretching the picture.
++ * presents the flipped frame through it. The frame (the guest's A8R8G8B8,
++ * i.e. B8G8R8A8 in memory order) is uploaded into its own texture and drawn
++ * into a back buffer the size of the window's client area, letterboxed to
++ * the frame's aspect ratio on black -- the window can be any size (or
++ * borderless fullscreen) without stretching the picture.
++ *
++ * Smooth motion (see also xbox_VblankDiscipline in kernel_bridge.c):
++ *
++ *  - The swap chain uses the flip model (FLIP_DISCARD, frame latency 1)
++ *    when the system has it. Besides lower latency, that is what lets a
++ *    variable-refresh (G-Sync / FreeSync) display in borderless fullscreen
++ *    show each 60 fps frame the moment it is presented, so a 144 Hz VRR
++ *    monitor runs at 60 Hz for us instead of juddering.
++ *  - The window presents each game frame once, when the title flips it
++ *    (fb_present.c), rather than re-presenting whatever is newest at every
++ *    refresh.
++ *  - A display-clock thread watches the monitor's real vblanks
++ *    (IDXGIOutput::WaitForVBlank). When the refresh rate is 60 Hz or a
++ *    multiple (59.94, 120, 240 ...), it locks the game's frame clock to it,
++ *    so each frame is shown for exactly the same number of refreshes.
++ *    RECOMP_PACING=timer turns the lock off (the old free-running clock).
++ *  - In fullscreen on a display the clock cannot lock to (144, 165 Hz),
++ *    RECOMP_REFRESH_SWITCH=1 switches the monitor to the best 60 Hz
++ *    multiple it offers at the same resolution while the game is
++ *    fullscreen (restored on leaving fullscreen or exit).
+  *
+  * Opt-in with RECOMP_D3D_PRESENT=1; anything that fails falls back to GDI.
+  * Linear filtering, RECOMP_PRESENT_FILTER=point for sharp pixels;
+@@ -18,13 +38,18 @@
+ #define COBJMACROS
+ #include <windows.h>
+ #include <d3d11.h>
+-#include <dxgi.h>
++#include <dxgi1_5.h>
+ #include <d3dcompiler.h>
+ #include <stdio.h>
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include "gpu_present.h"
++#include "platform/host_time.h"
++#include "platform/perf_log.h"
++
++extern void xbox_VblankDiscipline(uint64_t edge_ns, uint64_t display_period_ns, int every);
++extern int  xbox_VblankLockErrorUs(void);
+ 
+ static ID3D11Device             *s_dev;
+ static ID3D11DeviceContext      *s_ctx;
+@@ -39,6 +64,14 @@ static HWND                      s_hwnd;
+ static uint32_t                  s_w, s_h;      /* frame size */
+ static uint32_t                  s_bw, s_bh;    /* back buffer (client) size */
+ static int                       s_vsync = 1;
++static int                       s_flip;        /* flip-model swap chain */
++static int                       s_vrr_capable; /* the system offers tearing/VRR presents */
++static char                      s_desc[64] = "D3D11";
++
++/* Display clock state, written by its thread. */
++static volatile LONG             s_lock_every;  /* refreshes per game frame when locked, else 0 */
++static volatile LONG             s_clock_run;
++static HANDLE                    s_clock_thread;
+ 
+ /* A triangle covering the viewport, from the vertex id; uv 0..1. */
+ static const char s_hlsl[] =
+@@ -58,6 +91,12 @@ int gpu_present_enabled(void)
+     return on;
+ }
+ 
++static int env_off(const char *name)
++{
++    const char *e = getenv(name);
++    return e && (*e == '0' || !_stricmp(e, "off") || !_stricmp(e, "timer"));
++}
++
+ static void client_size(uint32_t *w, uint32_t *h)
+ {
+     RECT r;
+@@ -92,9 +131,254 @@ static ID3DBlob *compile(const char *entry, const char *target)
+     return code;
+ }
+ 
+-int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
++/* ---------------------------------------------------------------- display clock */
++
++/* The DXGI output (monitor) the window is on, or NULL. */
++static IDXGIOutput *output_for_window(void)
++{
++    IDXGIFactory1 *fac = NULL;
++    IDXGIAdapter1 *ad = NULL;
++    IDXGIOutput *found = NULL;
++    HMONITOR mon = MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST);
++    UINT a, o;
++    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&fac)))
++        return NULL;
++    for (a = 0; !found && IDXGIFactory1_EnumAdapters1(fac, a, &ad) == S_OK; a++) {
++        IDXGIOutput *out = NULL;
++        for (o = 0; !found && IDXGIAdapter1_EnumOutputs(ad, o, &out) == S_OK; o++) {
++            DXGI_OUTPUT_DESC d;
++            if (SUCCEEDED(IDXGIOutput_GetDesc(out, &d)) && d.Monitor == mon)
++                found = out;
++            else
++                IDXGIOutput_Release(out);
++        }
++        IDXGIAdapter1_Release(ad);
++    }
++    IDXGIFactory1_Release(fac);
++    return found;
++}
++
++/* The refresh rate Windows reports for the window's monitor, in Hz (0 if
++ * unknown): a starting point for the measured value. */
++static double reported_hz(void)
++{
++    MONITORINFOEXW mi;
++    DEVMODEW dm;
++    mi.cbSize = sizeof mi;
++    if (!GetMonitorInfoW(MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST), (MONITORINFO *)&mi))
++        return 0;
++    memset(&dm, 0, sizeof dm);
++    dm.dmSize = sizeof dm;
++    if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) || dm.dmDisplayFrequency <= 1)
++        return 0;
++    return dm.dmDisplayFrequency == 59 ? 60000.0 / 1001.0
++         : dm.dmDisplayFrequency == 119 ? 120000.0 / 1001.0 : (double)dm.dmDisplayFrequency;
++}
++
++/* Every how many refreshes a 60 fps frame lands, when the rate is (close
++ * to) a multiple of 60 Hz; 0 when it is not. */
++static int lock_every(double hz)
++{
++    int n;
++    if (hz < 50.0)
++        return 0;
++    n = (int)(hz / 60.0 + 0.5);
++    if (n < 1)
++        return 0;
++    return (hz / n > 59.4 && hz / n < 60.6) ? n : 0;
++}
++
++static DWORD WINAPI clock_thread(LPVOID unused)
++{
++    IDXGIOutput *out = NULL;
++    uint64_t last = 0;
++    double est = 0;                  /* measured refresh period, ns */
++    int good = 0, fast = 0, odd = 0, locked = 0, every = 0;
++    DWORD next_output = 0, next_report = 0;
++    const int pacing_on = !env_off("RECOMP_PACING");
++    (void)unused;
++
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
++    while (s_clock_run) {
++        DWORD now_tick = GetTickCount();
++        uint64_t t;
++        if (!out || (int)(now_tick - next_output) >= 0) {
++            /* Again every 2 s: the window may have moved to another monitor
++             * or the mode changed. */
++            IDXGIOutput *o2 = output_for_window();
++            if (out) IDXGIOutput_Release(out);
++            out = o2;
++            next_output = now_tick + 2000;
++            if (!est) {
++                double hz = reported_hz();
++                if (hz > 0) est = 1e9 / hz;
++            }
++        }
++        if (!out || FAILED(IDXGIOutput_WaitForVBlank(out))) {
++            Sleep(16);
++            last = 0;
++            good = 0;
++            continue;
++        }
++        t = xbox_HostNowNs();
++        if (last) {
++            double dt = (double)(t - last);
++            if (dt < 2e6) {
++                /* Returns at once while the window is minimised or the
++                 * display is off: no clock to follow then. */
++                if (++fast > 10) {
++                    good = 0;
++                    Sleep(16);
++                }
++            } else {
++                fast = 0;
++                if (!est)
++                    est = dt;
++                if (dt > est * 0.75 && dt < est * 1.25) {
++                    est += (dt - est) / 64.0;       /* about a second's average */
++                    good++;
++                    odd = 0;
++                } else if (++odd > 20) {
++                    est = dt;                       /* the mode changed */
++                    good = 0;
++                    odd = 0;
++                }
++            }
++        }
++        last = t;
++        {
++            double hz = est > 0 ? 1e9 / est : 0;
++            int n = lock_every(hz);
++            if (pacing_on && n && good >= 60) {
++                xbox_VblankDiscipline(t, (uint64_t)est, n);
++                if (!locked || n != every)
++                    fprintf(stderr, "  [D3D] display %.2f Hz: game frames locked to it%s\n", hz,
++                            n > 1 ? " (every few refreshes)" : "");
++                locked = 1;
++                every = n;
++            } else if (locked && (!n || good < 60)) {
++                xbox_VblankDiscipline(0, 0, 0);
++                fprintf(stderr, "  [D3D] display %.2f Hz: game frames on their own timer\n", hz);
++                locked = 0;
++                every = 0;
++            }
++            InterlockedExchange(&s_lock_every, locked ? every : 0);
++            if ((int)(now_tick - next_report) >= 0) {
++                char d[96];
++                _snprintf_s(d, sizeof d, _TRUNCATE, "%s%s", s_desc,
++                            !locked && hz > 70 && !n ? " (not a 60 Hz multiple: smooth only with G-Sync/FreeSync or the refresh switch)" : "");
++                xbox_PerfDisplay(hz, locked, every, locked ? xbox_VblankLockErrorUs() / 1000.0 : 0.0, d);
++                next_report = now_tick + 1000;
++            }
++        }
++    }
++    if (locked)
++        xbox_VblankDiscipline(0, 0, 0);
++    if (out)
++        IDXGIOutput_Release(out);
++    return 0;
++}
++
++int gpu_present_expected_refreshes(void)
++{
++    return (int)s_lock_every;
++}
++
++/* ---------------------------------------------------------------- refresh switch */
++
++static int     s_switched;
++static wchar_t s_switched_dev[CCHDEVICENAME];
++
++void gpu_present_fullscreen(int full)
++{
++    MONITORINFOEXW mi;
++    DEVMODEW cur, dm, best;
++    DWORD i;
++    int have = 0;
++
++    if (!full) {
++        if (s_switched) {
++            ChangeDisplaySettingsExW(s_switched_dev, NULL, NULL, 0, NULL);
++            s_switched = 0;
++            fprintf(stderr, "  [D3D] display refresh restored\n");
++            xbox_PerfNote("display: refresh rate restored (left fullscreen)");
++        }
++        return;
++    }
++    if (env_off("RECOMP_REFRESH_SWITCH") || !getenv("RECOMP_REFRESH_SWITCH") || s_switched)
++        return;
++    mi.cbSize = sizeof mi;
++    if (!GetMonitorInfoW(MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST), (MONITORINFO *)&mi))
++        return;
++    memset(&cur, 0, sizeof cur);
++    cur.dmSize = sizeof cur;
++    if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &cur))
++        return;
++    if (lock_every((double)cur.dmDisplayFrequency))
++        return;                                     /* already a 60 Hz multiple */
++    memset(&best, 0, sizeof best);
++    for (i = 0;; i++) {
++        memset(&dm, 0, sizeof dm);
++        dm.dmSize = sizeof dm;
++        if (!EnumDisplaySettingsW(mi.szDevice, i, &dm))
++            break;
++        if (dm.dmPelsWidth != cur.dmPelsWidth || dm.dmPelsHeight != cur.dmPelsHeight
++            || dm.dmBitsPerPel != cur.dmBitsPerPel || !lock_every((double)dm.dmDisplayFrequency)
++            || dm.dmDisplayFrequency > cur.dmDisplayFrequency)
++            continue;
++        if (!have || dm.dmDisplayFrequency > best.dmDisplayFrequency) {
++            best = dm;
++            have = 1;
++        }
++    }
++    if (!have) {
++        fprintf(stderr, "  [D3D] display %u Hz has no 60/120 Hz mode at %ux%u; refresh left alone\n",
++                (unsigned)cur.dmDisplayFrequency, (unsigned)cur.dmPelsWidth, (unsigned)cur.dmPelsHeight);
++        xbox_PerfNote("display: %u Hz and no 60 Hz multiple offered at %ux%u, refresh not switched",
++                      (unsigned)cur.dmDisplayFrequency, (unsigned)cur.dmPelsWidth, (unsigned)cur.dmPelsHeight);
++        return;
++    }
++    best.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
++    /* CDS_FULLSCREEN: temporary, and Windows restores it when we exit. */
++    if (ChangeDisplaySettingsExW(mi.szDevice, &best, NULL, CDS_FULLSCREEN, NULL) == DISP_CHANGE_SUCCESSFUL) {
++        s_switched = 1;
++        wcsncpy_s(s_switched_dev, CCHDEVICENAME, mi.szDevice, _TRUNCATE);
++        fprintf(stderr, "  [D3D] fullscreen: display switched %u Hz -> %u Hz for smooth 60 fps\n",
++                (unsigned)cur.dmDisplayFrequency, (unsigned)best.dmDisplayFrequency);
++        xbox_PerfNote("display: switched %u Hz -> %u Hz for fullscreen",
++                      (unsigned)cur.dmDisplayFrequency, (unsigned)best.dmDisplayFrequency);
++    } else {
++        fprintf(stderr, "  [D3D] could not switch the display to %u Hz\n", (unsigned)best.dmDisplayFrequency);
++    }
++}
++
++/* ---------------------------------------------------------------- swap chain */
++
++static HRESULT create_chain(int flip, HWND hwnd)
+ {
+     DXGI_SWAP_CHAIN_DESC sd;
++    ZeroMemory(&sd, sizeof sd);
++    sd.BufferDesc.Width  = s_bw;
++    sd.BufferDesc.Height = s_bh;
++    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    sd.SampleDesc.Count  = 1;
++    sd.BufferUsage       = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++    sd.OutputWindow      = hwnd;
++    sd.Windowed          = TRUE;
++    if (flip) {
++        sd.BufferCount = 2;
++        sd.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++    } else {
++        sd.BufferCount = 1;
++        sd.SwapEffect  = DXGI_SWAP_EFFECT_DISCARD;
++    }
++    return D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
++                                         NULL, 0, D3D11_SDK_VERSION, &sd,
++                                         &s_chain, &s_dev, NULL, &s_ctx);
++}
++
++int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
++{
+     D3D11_TEXTURE2D_DESC td;
+     D3D11_SAMPLER_DESC smp;
+     ID3DBlob *vsb, *psb;
+@@ -106,20 +390,16 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
+     s_hwnd = hwnd;
+     s_w = width; s_h = height;
+     client_size(&s_bw, &s_bh);
+-    ZeroMemory(&sd, sizeof sd);
+-    sd.BufferDesc.Width  = s_bw;
+-    sd.BufferDesc.Height = s_bh;
+-    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+-    sd.SampleDesc.Count  = 1;
+-    sd.BufferUsage       = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+-    sd.BufferCount       = 1;
+-    sd.OutputWindow      = hwnd;
+-    sd.Windowed          = TRUE;
+-    sd.SwapEffect        = DXGI_SWAP_EFFECT_DISCARD;
+ 
+-    hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+-                                       NULL, 0, D3D11_SDK_VERSION, &sd,
+-                                       &s_chain, &s_dev, NULL, &s_ctx);
++    s_flip = !env_off("RECOMP_FLIP_MODEL");
++    hr = s_flip ? create_chain(1, hwnd) : E_FAIL;
++    if (FAILED(hr)) {
++        if (s_flip)
++            fprintf(stderr, "  [D3D] flip-model swap chain unavailable (0x%08lX); using the blit model\n",
++                    (unsigned long)hr);
++        s_flip = 0;
++        hr = create_chain(0, hwnd);
++    }
+     if (FAILED(hr)) {
+         fprintf(stderr, "  [D3D] device/swap chain failed (0x%08lX); staying on GDI\n",
+                 (unsigned long)hr);
+@@ -130,10 +410,26 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
+          * not DXGI's exclusive mode at 640x480. */
+         IDXGIFactory *fac = NULL;
+         if (SUCCEEDED(IDXGISwapChain_GetParent(s_chain, &IID_IDXGIFactory, (void **)&fac))) {
++            IDXGIFactory5 *f5 = NULL;
+             IDXGIFactory_MakeWindowAssociation(fac, hwnd, DXGI_MWA_NO_ALT_ENTER);
++            if (SUCCEEDED(IDXGIFactory_QueryInterface(fac, &IID_IDXGIFactory5, (void **)&f5))) {
++                BOOL t = FALSE;
++                if (SUCCEEDED(IDXGIFactory5_CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING,
++                                                                &t, sizeof t)))
++                    s_vrr_capable = t ? 1 : 0;
++                IDXGIFactory5_Release(f5);
++            }
+             IDXGIFactory_Release(fac);
+         }
+     }
++    {
++        /* One frame queued at most: a present never waits behind an older one. */
++        IDXGIDevice1 *d1 = NULL;
++        if (SUCCEEDED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice1, (void **)&d1))) {
++            IDXGIDevice1_SetMaximumFrameLatency(d1, 1);
++            IDXGIDevice1_Release(d1);
++        }
++    }
+     ZeroMemory(&td, sizeof td);
+     td.Width = width; td.Height = height; td.MipLevels = 1; td.ArraySize = 1;
+     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+@@ -161,12 +457,44 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
+     }
+     ID3D10Blob_Release(vsb);
+     ID3D10Blob_Release(psb);
+-    fprintf(stderr, "  [D3D] presenting through D3D11 (%ux%u frame, vsync %s, %s filter)\n",
++    _snprintf_s(s_desc, sizeof s_desc, _TRUNCATE, "%s swap chain%s",
++                s_flip ? "flip-model" : "blit-model",
++                s_vrr_capable ? ", VRR-capable system" : "");
++    fprintf(stderr, "  [D3D] presenting through D3D11 (%ux%u frame, vsync %s, %s filter, %s)\n",
+             width, height, s_vsync ? "on" : "off",
+-            smp.Filter == D3D11_FILTER_MIN_MAG_MIP_POINT ? "point" : "linear");
++            smp.Filter == D3D11_FILTER_MIN_MAG_MIP_POINT ? "point" : "linear", s_desc);
++    xbox_PerfNote("presenter: D3D11, %s, vsync %s, pacing %s", s_desc, s_vsync ? "on" : "off",
++                  env_off("RECOMP_PACING") ? "game timer (RECOMP_PACING=timer)" : "locked to the display when possible");
++    if (s_vsync) {
++        InterlockedExchange(&s_clock_run, 1);
++        s_clock_thread = CreateThread(NULL, 0, clock_thread, NULL, 0, NULL);
++    }
+     return 1;
+ }
+ 
++/* Frame statistics after a present: how many refreshes the previous frame
++ * stayed on screen, for the performance log. Only meaningful when each
++ * present is a new game frame (fb_present.c presents on flips). */
++static void frame_stats(void)
++{
++    static UINT last_pc, last_prc;
++    static int unsupported;
++    DXGI_FRAME_STATISTICS fs;
++    if (unsupported || !xbox_PerfEnabled())
++        return;
++    if (FAILED(IDXGISwapChain_GetFrameStatistics(s_chain, &fs))) {
++        if (++unsupported == 1)
++            xbox_PerfNote("presenter: frame statistics not available here (windowed/composed?)");
++        return;
++    }
++    if (fs.PresentCount == last_pc + 1 && last_prc && fs.PresentRefreshCount > last_prc)
++        xbox_PerfShown(fs.PresentRefreshCount - last_prc, (uint32_t)s_lock_every);
++    if (fs.PresentCount != last_pc) {
++        last_pc = fs.PresentCount;
++        last_prc = fs.PresentRefreshCount;
++    }
++}
++
+ /* Returns 0 when nothing was shown: the window is occluded or the display
+  * is off, and Present does not wait for vsync then -- the caller must pace
+  * itself instead of spinning. The pixels are read before this returns. */
+@@ -176,6 +504,7 @@ int gpu_present_frame(const uint32_t *pixels)
+     D3D11_VIEWPORT vp;
+     uint32_t cw, ch;
+     float sx, sy;
++    HRESULT hr;
+ 
+     if (!s_rtv || !pixels)
+         return 0;
+@@ -192,6 +521,7 @@ int gpu_present_frame(const uint32_t *pixels)
+     }
+     ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_frame, 0, NULL,
+                                           pixels, s_w * 4, 0);
++    /* The flip model unbinds the back buffer at each present. */
+     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
+     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, black);
+     /* The largest rectangle of the frame's shape that fits, centred. */
+@@ -212,11 +542,31 @@ int gpu_present_frame(const uint32_t *pixels)
+     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+     /* Paced only when Present waited for the vblank: with RECOMP_PRESENT_VSYNC=0
+      * the caller keeps its own 16 ms sleep instead of spinning a core. */
+-    return IDXGISwapChain_Present(s_chain, (UINT)s_vsync, 0) == S_OK && s_vsync;
++    hr = IDXGISwapChain_Present(s_chain, (UINT)s_vsync, 0);
++    if (hr == S_OK)
++        frame_stats();
++    return hr == S_OK && s_vsync;
++}
++
++int gpu_present_active(void)
++{
++    return s_rtv != NULL;
++}
++
++int gpu_present_flip_model(void)
++{
++    return s_flip;
+ }
+ 
+ void gpu_present_shutdown(void)
+ {
++    if (s_clock_thread) {
++        InterlockedExchange(&s_clock_run, 0);
++        WaitForSingleObject(s_clock_thread, 200);
++        CloseHandle(s_clock_thread);
++        s_clock_thread = NULL;
++    }
++    gpu_present_fullscreen(0);
+     if (s_ps)    { ID3D11PixelShader_Release(s_ps);           s_ps = NULL; }
+     if (s_vs)    { ID3D11VertexShader_Release(s_vs);          s_vs = NULL; }
+     if (s_samp)  { ID3D11SamplerState_Release(s_samp);        s_samp = NULL; }
+@@ -227,9 +577,4 @@ void gpu_present_shutdown(void)
+     if (s_ctx)   { ID3D11DeviceContext_Release(s_ctx);        s_ctx = NULL; }
+     if (s_dev)   { ID3D11Device_Release(s_dev);               s_dev = NULL; }
+ }
+-
+-int gpu_present_active(void)
+-{
+-    return s_rtv != NULL;
+-}
+ #endif
+diff --git a/src/video/gpu_present.h b/src/video/gpu_present.h
+index 4e14e91..f58d21a 100644
+--- a/src/video/gpu_present.h
++++ b/src/video/gpu_present.h
+@@ -11,6 +11,11 @@ int  gpu_present_init(HWND hwnd, uint32_t width, uint32_t height);
+  * (so the caller need not sleep), 0 when unpaced or nothing was shown. */
+ int  gpu_present_frame(const uint32_t *pixels);
+ int  gpu_present_active(void);
++/* Borderless fullscreen entered (1) or left (0): the refresh switch. */
++void gpu_present_fullscreen(int full);
++/* Refreshes each game frame should stay on screen (0: no steady value). */
++int  gpu_present_expected_refreshes(void);
++int  gpu_present_flip_model(void);
+ void gpu_present_shutdown(void);
+ #endif
+ #endif
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
 index 775612f..c69c950 100644
 --- a/tools/recomp/lifter.py

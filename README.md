@@ -18,7 +18,8 @@ This repo is the plain port. Online play lives in a separate edition, [hitz-xbox
 hitz_pro/                  the game project
   CMakeLists.txt           builds hitz_pro_recomp.exe against ../xboxrecomp
   build_windows.bat        MSVC + Ninja build (finds Visual Studio on its own)
-  run_hitz.bat             launcher with the default settings
+  HitzLauncher.exe         settings window + Play (copied here by setup)
+  run_hitz.bat             starts the game straight away with the defaults
   src/main.c               entry point, title defaults, crash handler
   src/recomp_manual.c      hand-written overrides of recompiled functions
   src/recomp_kick.c        D3D KickOff without the PFB-flush spin
@@ -60,7 +61,7 @@ cd hitz-xbox
 setup.bat --iso "D:\Games\NHL Hitz Pro (USA).iso"
 ```
 
-Then play with `hitz_pro\run_hitz.bat`, or add `--run` to the setup command to start the game when it finishes.
+Then play with **`hitz_pro\HitzLauncher.exe`** (pick your settings, press Play), or `hitz_pro\run_hitz.bat` to start straight away with the defaults. Add `--run` to the setup command to start the game when it finishes.
 
 `setup.bat` does every step in the next section:
 1. Fetches the toolkit, checks out the right commit and applies the patch.
@@ -171,13 +172,37 @@ If the link fails with "cannot open file", the game is still running. Close it, 
 
 ### 6. Run
 
-Double-click `hitz_pro\run_hitz.bat`, or run it from a command prompt. It starts the exe with `hitz_pro\` as the working directory, which is where it finds `game\default.xbe`. Log output goes to `hitz_pro\hitz_stderr.log`; it reports fps every 10 s.
+Double-click `hitz_pro\HitzLauncher.exe` (or `run_hitz.bat`). Either starts the exe with `hitz_pro\` as the working directory, which is where it finds `game\default.xbe`. Log output goes to `hitz_pro\hitz_stderr.log`; it reports fps every 10 s.
+
+**The launcher** has the settings players need, saved in `hitz_pro\hitz_settings.ini`:
+
+- **Display:** windowed or fullscreen, window size, smooth or sharp picture, frame pacing, the fullscreen refresh switch, and which GPU to use.
+- **Controls:** number of players, keyboard as player 1, non-Xbox controllers on/off, and a list of the controllers it can see.
+- **Diagnostics:** the performance log on/off, and a button that opens the folder with the logs.
+
+### Smooth motion
+
+The game runs at 60 frames a second. To show every frame for the same length of time:
+
+- On a 60 Hz monitor (or 120/240 Hz), the game's frame clock locks to the monitor's refresh, so frames are never doubled or skipped.
+- On a 144/165 Hz monitor, 60 doesn't divide evenly into the refresh rate. With G-Sync/FreeSync, fullscreen is smooth anyway. Without it, the launcher's **refresh switch** (on by default) switches the monitor to 120 or 60 Hz while the game is fullscreen and back when you leave.
+- F11 or Alt+Enter toggles fullscreen.
+
+### Performance log and F9
+
+`hitz_pro\hitz_perf.log` (on by default) records stutter so it can be tracked down later: your PC, monitor and settings at the top, then a `HITCH` line for any frame that took clearly longer than the ones around it (with what happened during it: shaders, textures, files loaded), `JUDDER` when a frame stayed on screen for an uneven time, and a summary every 5 seconds. Times are wall clock.
+
+**When something feels laggy, press F9.** It writes a numbered `MARK` into the log (the window title shows "F9 mark N saved"), so the moment can be found afterwards.
 
 ---
 
 ## Controls
 
-**XInput controllers** (Xbox 360/One/Series pads) map one-to-one to the Xbox pad.
+**Xbox controllers** (360/One/Series, and anything in XInput mode) map one-to-one to the Xbox pad.
+
+**Other controllers** (8BitDo in Switch or D-input mode, PlayStation, Switch Pro, most USB/Bluetooth pads) work through SDL2, which setup downloads (`build\SDL2.dll`). Buttons go by position: the bottom face button is A, as on an Xbox pad.
+
+Players are numbered in the order controllers connect, whatever kind they are, and they can be plugged in or out at any time. `hitz_stderr.log` and `hitz_perf.log` name each controller and its player (`[PAD] player 1: ...`).
 
 For two players on one machine, plug in two controllers. `run_hitz.bat` sets `RECOMP_USB_PADS=2`. On the team-select screen each player pushes the stick toward **Away** or **Home**, then presses **A**.
 
@@ -218,6 +243,13 @@ You only need these to change behaviour or to debug. `main.c` and `run_hitz.bat`
 |---|---|
 | `RECOMP_USB_PADS=1..4` | number of controllers |
 | `RECOMP_KEYBOARD=1` | keyboard as pad 1 |
+| `HITZ_PACING=timer` | don't lock the frame clock to the display (the old free-running 60 Hz) |
+| `HITZ_REFRESH_SWITCH=0` | never change the monitor's refresh rate in fullscreen |
+| `HITZ_PERF_LOG=0` | no `hitz_perf.log` |
+| `HITZ_SDL_PADS=0` | only Xbox (XInput) controllers |
+| `HITZ_GPU_ASYNC_SHADERS=0` | compile new shaders on the render thread (stalls a frame each, as before) |
+| `HITZ_SHADER_CACHE=0` | don't keep compiled shaders in `hitz_pro\cache\` |
+| `HITZ_LOG_DIRECT=1` | write the log directly instead of through the background writer |
 | `HITZ_GPU_ADAPTER=<text>` | pick the GPU whose name contains the text |
 | `HITZ_GPU_VSH=0` | vertex programs on the CPU instead of the GPU |
 | `HITZ_GPU_UBER=1` | one general pixel shader instead of per-state ones (slower; for checking) |

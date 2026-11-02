@@ -81,6 +81,9 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${XBOXRECOMP_DIR}/include
     ${XBOXRECOMP_DIR}/src/kernel
 )
+# The renderer reports to the performance log (platform/perf_log.h). On the
+# one file: a target-wide include path would rebuild every generated file.
+set_source_files_properties(src/nv2a_d3d11.c PROPERTIES INCLUDE_DIRECTORIES "${XBOXRECOMP_DIR}/src")
 
 # Windows SDK libraries needed at link time
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -120,3 +123,16 @@ endif()
 #     ENABLE_ICALL_TRACE=1
 #     VERBOSE_KERNEL_LOG=1
 # )
+
+# The settings launcher (src/launcher/hitz_launcher.c): display, controls and
+# diagnostics options for players, saved in hitz_settings.ini, then starts
+# the game with them. setup.py copies it to hitz_pro/HitzLauncher.exe.
+if(WIN32)
+    add_executable(hitz_launcher WIN32 src/launcher/hitz_launcher.c)
+    target_compile_definitions(hitz_launcher PRIVATE UNICODE _UNICODE)
+    target_link_libraries(hitz_launcher PRIVATE user32 gdi32 comctl32 shell32 dxgi
+                          $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput> ole32)
+    if(MSVC)
+        target_compile_options(hitz_launcher PRIVATE /W4 /utf-8)
+    endif()
+endif()

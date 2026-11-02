@@ -27,6 +27,8 @@
 #include <string.h>
 #include <stddef.h>
 #include "nv2a_backend.h"
+#include "platform/perf_log.h"
+static void psc_init(void);           /* the shader cache, defined below */
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -724,6 +726,8 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
         tex_link(slot);
         s_st.tex_up++;
         s_st.tex_up_bytes += (unsigned long long)t->width * t->height * faces * 4;
+        xbox_PerfCount(XBOX_PERF_TEXTURES, 1);
+        xbox_PerfCount(XBOX_PERF_TEX_BYTES, (double)t->width * t->height * faces * 4);
         *is_cube = (int)t->cube;
         return x->srv;
     }
@@ -940,6 +944,7 @@ static int init_device(void)
     }
     ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext1, (void **)&s_ctx1);
     fprintf(stderr, "[D3D11] rendering on %s\n", pick ? name : "default adapter");
+    xbox_PerfNote("gpu: %s", pick ? name : "default adapter");
 
     hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "nv2a", NULL, NULL, "vs_main", "vs_5_0",
                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsb, &err);
@@ -1030,6 +1035,7 @@ static int init_device(void)
         ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs[2]);
     }
     s_cull = getenv("HITZ_GPU_CULL") && *getenv("HITZ_GPU_CULL") == '1';
+    psc_init();
     return 1;
 }
 
@@ -1163,39 +1169,234 @@ static void gprof_report(void)
     s_gp_vs = s_gp_psi = s_gp_iav = s_gp_frames = 0;
 }
 
-/* ---- specialised pixel-shader cache ---- */
+/* ---- specialised pixel-shader cache ----
+ *
+ * A pixel shader specialised to each combiner/alpha-test state is much
+ * faster than the general one, but compiling one takes ~20 ms -- longer
+ * than a frame. Compiled on the render thread the first time a state
+ * appeared, each new state was a dropped frame: the "random" stutters, and
+ * a burst of them when a scene (a goal replay) brings several new states.
+ *
+ *  - Misses are compiled on a background thread; until the shader is ready
+ *    those draws use the general shader, which renders the same picture.
+ *    HITZ_GPU_ASYNC_SHADERS=0 compiles on the render thread as before.
+ *  - Every compiled shader is appended to cache\hitz_shaders.bin, and the
+ *    file is loaded at start, so a state seen in any earlier session costs
+ *    nothing. The file carries a hash of the shader source: a build whose
+ *    shaders changed starts it afresh. HITZ_SHADER_CACHE=0 turns it off. */
 typedef struct {
     uint32_t n, flags, sp, use_rc, tex, at, af, cube, norm, fin0, fin1;
     uint32_t icw[8], ocw[8], aicw[8], aocw[8];
 } PsKey;
-typedef struct { PsKey k; uint64_t h; ID3D11PixelShader *ps; int used; } PsEnt;
+typedef struct { PsKey k; uint64_t h; ID3D11PixelShader *volatile ps; volatile LONG state; int used; } PsEnt;
+enum { PS_NONE, PS_QUEUED, PS_READY, PS_FAILED };
 #define PS_CACHE 2048
 static PsEnt s_psc[PS_CACHE];
 static int s_spec_on = -1;
-static unsigned s_spec_compiled, s_spec_failed;
+static unsigned s_spec_compiled, s_spec_failed, s_spec_loaded, s_spec_async;
 static double s_spec_ms;
-static ID3D11PixelShader *ps_for(const PsKey *k)
+
+#define PSC_FILE "cache\\hitz_shaders.bin"
+#define PSC_MAGIC 0x3153505Au                   /* "ZPS1" */
+static CRITICAL_SECTION s_psc_cs;               /* the file and the job ring */
+static CONDITION_VARIABLE s_psc_cv;
+static int s_psc_async = -1, s_psc_disk = -1;
+static uint64_t s_psc_src_hash;
+#define PSQ 256
+static struct { int slot; char *src; size_t len; } s_psq[PSQ];
+static unsigned s_psq_head, s_psq_tail;
+
+static uint64_t fnv(const void *p, size_t n, uint64_t h)
 {
-    uint64_t h = 0xcbf29ce484222325ull;
-    const uint8_t *p = (const uint8_t *)k;
-    size_t i;
-    uint32_t slot;
-    for (i = 0; i < sizeof *k; i++) h = (h ^ p[i]) * 0x100000001b3ull;
-    slot = (uint32_t)(h >> 40) & (PS_CACHE - 1);
+    const uint8_t *b = (const uint8_t *)p;
+    while (n--) h = (h ^ *b++) * 0x100000001b3ull;
+    return h;
+}
+
+static uint64_t key_hash(const PsKey *k)
+{
+    return fnv(k, sizeof *k, 0xcbf29ce484222325ull);
+}
+
+/* The slot for a key: its entry, or the free slot it would take (or -1 if
+ * the table is full). *found says which. */
+static int ps_slot(const PsKey *k, uint64_t h, int *found)
+{
+    uint32_t slot = (uint32_t)(h >> 40) & (PS_CACHE - 1);
+    int i;
     for (i = 0; i < PS_CACHE; i++, slot = (slot + 1) & (PS_CACHE - 1)) {
         PsEnt *e = &s_psc[slot];
-        if (!e->used) break;
-        if (e->h == h && !memcmp(&e->k, k, sizeof *k)) return e->ps;
+        if (!e->used) { *found = 0; return (int)slot; }
+        if (e->h == h && !memcmp(&e->k, k, sizeof *k)) { *found = 1; return (int)slot; }
     }
-    if (i == PS_CACHE) return NULL;
+    *found = 0;
+    return -1;
+}
+
+static void psc_append(const PsKey *k, const void *code, uint32_t len)
+{
+    FILE *f;
+    if (s_psc_disk <= 0)
+        return;
+    EnterCriticalSection(&s_psc_cs);
+    if (fopen_s(&f, PSC_FILE, "ab") == 0 && f) {
+        uint32_t ks = (uint32_t)sizeof *k;
+        fwrite(&ks, 4, 1, f); fwrite(k, sizeof *k, 1, f);
+        fwrite(&len, 4, 1, f); fwrite(code, 1, len, f);
+        fclose(f);
+    }
+    LeaveCriticalSection(&s_psc_cs);
+}
+
+/* Compile one key's source into its entry (render thread or worker). */
+static void ps_compile(int slot, const char *src, size_t len, int background)
+{
+    PsEnt *e = &s_psc[slot];
+    ID3DBlob *bl = NULL, *err = NULL;
+    ID3D11PixelShader *ps = NULL;
+    unsigned long long t0 = now_ns();
+    double ms;
+    if (SUCCEEDED(D3DCompile(src, len, "nv2a_spec", NULL, NULL, "ps_spec", "ps_5_0",
+                             D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &bl, &err))) {
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(bl), ID3D10Blob_GetBufferSize(bl), NULL, &ps);
+        if (ps)
+            psc_append(&e->k, ID3D10Blob_GetBufferPointer(bl), (uint32_t)ID3D10Blob_GetBufferSize(bl));
+        ID3D10Blob_Release(bl);
+    } else if (s_spec_failed < 3) {
+        fprintf(stderr, "[D3D11] spec PS failed: %s\n", err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?");
+    }
+    if (err) ID3D10Blob_Release(err);
+    ms = (now_ns() - t0) / 1e6;
+    EnterCriticalSection(&s_psc_cs);
+    if (ps) s_spec_compiled++; else s_spec_failed++;
+    s_spec_ms += ms;
+    LeaveCriticalSection(&s_psc_cs);
+    if (!background) {
+        xbox_PerfCount(XBOX_PERF_SHADERS, 1);
+        xbox_PerfCount(XBOX_PERF_SHADER_MS, ms);
+    }
+    e->ps = ps;
+    InterlockedExchange(&e->state, ps ? PS_READY : PS_FAILED);
+}
+
+static DWORD WINAPI ps_worker(LPVOID unused)
+{
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        int slot;
+        char *src;
+        size_t len;
+        EnterCriticalSection(&s_psc_cs);
+        while (s_psq_head == s_psq_tail)
+            SleepConditionVariableCS(&s_psc_cv, &s_psc_cs, INFINITE);
+        slot = s_psq[s_psq_head].slot;
+        src = s_psq[s_psq_head].src;
+        len = s_psq[s_psq_head].len;
+        s_psq_head = (s_psq_head + 1) % PSQ;
+        LeaveCriticalSection(&s_psc_cs);
+        ps_compile(slot, src, len, 1);
+        free(src);
+    }
+}
+
+/* Load cache\hitz_shaders.bin into the table (at device start). */
+static void psc_load(void)
+{
+    FILE *f;
+    uint32_t hdr[4], ks, len;
+    unsigned long long t0 = now_ns();
+    unsigned n = 0, bad = 0;
+    if (fopen_s(&f, PSC_FILE, "rb") != 0 || !f) {
+        CreateDirectoryA("cache", NULL);
+        goto fresh;
+    }
+    if (fread(hdr, 4, 4, f) != 4 || hdr[0] != PSC_MAGIC || hdr[1] != (uint32_t)sizeof(PsKey)
+        || ((uint64_t)hdr[3] << 32 | hdr[2]) != s_psc_src_hash) {
+        fclose(f);
+        fprintf(stderr, "[D3D11] shader cache: built for other shaders; starting afresh\n");
+        goto fresh;
+    }
+    for (;;) {
+        PsKey k;
+        void *code;
+        int found, slot;
+        if (fread(&ks, 4, 1, f) != 1) break;
+        if (ks != sizeof k || fread(&k, sizeof k, 1, f) != 1 || fread(&len, 4, 1, f) != 1
+            || len == 0 || len > (1u << 20)) { bad++; break; }
+        code = malloc(len);
+        if (!code || fread(code, 1, len, f) != len) { free(code); bad++; break; }
+        {
+            uint64_t h = key_hash(&k);
+            slot = ps_slot(&k, h, &found);
+            if (slot >= 0 && !found) {
+                PsEnt *e = &s_psc[slot];
+                ID3D11PixelShader *ps = NULL;
+                if (SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, code, len, NULL, &ps)) && ps) {
+                    e->used = 1; e->h = h; e->k = k; e->ps = ps; e->state = PS_READY;
+                    n++;
+                }
+            }
+        }
+        free(code);
+    }
+    fclose(f);
+    s_spec_loaded = n;
+    fprintf(stderr, "[D3D11] shader cache: %u shaders loaded from %s in %.0f ms%s\n", n, PSC_FILE,
+            (now_ns() - t0) / 1e6, bad ? " (file truncated; the rest is rebuilt)" : "");
+    xbox_PerfNote("shader cache: %u shaders loaded (states seen in earlier sessions cost nothing)", n);
+    return;
+fresh:
+    if (fopen_s(&f, PSC_FILE, "wb") == 0 && f) {
+        hdr[0] = PSC_MAGIC; hdr[1] = (uint32_t)sizeof(PsKey);
+        hdr[2] = (uint32_t)s_psc_src_hash; hdr[3] = (uint32_t)(s_psc_src_hash >> 32);
+        fwrite(hdr, 4, 4, f);
+        fclose(f);
+    } else {
+        s_psc_disk = 0;
+        fprintf(stderr, "[D3D11] shader cache: cannot write %s; not kept\n", PSC_FILE);
+    }
+    xbox_PerfNote("shader cache: empty (new shaders are compiled in the background and kept)");
+}
+
+static void psc_init(void)
+{
+    const char *e;
+    InitializeCriticalSection(&s_psc_cs);
+    InitializeConditionVariable(&s_psc_cv);
+    e = getenv("HITZ_GPU_ASYNC_SHADERS");
+    s_psc_async = !(e && *e == '0');
+    e = getenv("HITZ_SHADER_CACHE");
+    s_psc_disk = !(e && *e == '0');
+    s_psc_src_hash = fnv(s_ps_spec_src, sizeof s_ps_spec_src - 1,
+                         fnv(s_hlsl, sizeof s_hlsl - 1, 0xcbf29ce484222325ull));
+    if (s_psc_disk)
+        psc_load();
+    if (s_psc_async) {
+        HANDLE th = CreateThread(NULL, 0, ps_worker, NULL, 0, NULL);
+        if (th) CloseHandle(th); else s_psc_async = 0;
+    }
+}
+
+static ID3D11PixelShader *ps_for(const PsKey *k)
+{
+    uint64_t h = key_hash(k);
+    int found, slot = ps_slot(k, h, &found);
+    PsEnt *e;
+    if (slot < 0) return NULL;
+    e = &s_psc[slot];
+    if (found) {
+        LONG st = e->state;
+        if (st == PS_READY) return e->ps;
+        if (st != PS_NONE) return NULL;          /* queued or failed: general shader */
+    } else {
+        e->used = 1; e->h = h; e->k = *k; e->ps = NULL; e->state = PS_NONE;
+    }
     {
         static char src[65536];
         char *o = src;
         size_t cap = sizeof src, hl = sizeof s_hlsl - 1, sl = sizeof s_ps_spec_src - 1;
         int j, w;
-        ID3DBlob *bl = NULL, *err = NULL;
-        unsigned long long t0 = now_ns();
-        PsEnt *e = &s_psc[slot];
         #define EMIT(...) do { w = snprintf(o, cap, __VA_ARGS__); o += w; cap -= (size_t)w; } while (0)
         EMIT("static const uint K_N = %u, K_FLAGS = 0x%X, K_SP = 0x%X, K_USE_RC = %u, K_TEX = %u, K_AT = %u, K_AF = 0x%X;\n",
              k->n, k->flags, k->sp, k->use_rc, k->tex, k->at, k->af);
@@ -1205,25 +1406,35 @@ static ID3D11PixelShader *ps_for(const PsKey *k)
         #define EMIT_ARR(nm, a) do { EMIT("static const uint %s[8] = {", nm); \
             for (j = 0; j < 8; j++) EMIT(" 0x%X%s", (a)[j], j < 7 ? "," : " };\n"); } while (0)
         EMIT_ARR("K_ICW", k->icw); EMIT_ARR("K_OCW", k->ocw); EMIT_ARR("K_AICW", k->aicw); EMIT_ARR("K_AOCW", k->aocw);
-        if (hl + sl + 1 >= cap) return NULL;
+        #undef EMIT_ARR
+        #undef EMIT
+        if (hl + sl + 1 >= cap) { e->state = PS_FAILED; return NULL; }
         memcpy(o, s_hlsl, hl); o += hl;
         memcpy(o, s_ps_spec_src, sl); o += sl;
         *o = 0;
-        e->used = 1; e->h = h; e->k = *k; e->ps = NULL;
-        if (SUCCEEDED(D3DCompile(src, (size_t)(o - src), "nv2a_spec", NULL, NULL, "ps_spec", "ps_5_0",
-                                 D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &bl, &err))) {
-            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(bl), ID3D10Blob_GetBufferSize(bl), NULL, &e->ps);
-            ID3D10Blob_Release(bl);
-            s_spec_compiled++;
-        } else {
-            if (s_spec_failed++ < 3)
-                fprintf(stderr, "[D3D11] spec PS failed: %s\n", err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?");
+        if (s_psc_async > 0) {
+            size_t len = (size_t)(o - src);
+            char *copy = (char *)malloc(len);
+            EnterCriticalSection(&s_psc_cs);
+            if (copy && (s_psq_tail + 1) % PSQ != s_psq_head) {
+                memcpy(copy, src, len);
+                s_psq[s_psq_tail].slot = slot;
+                s_psq[s_psq_tail].src = copy;
+                s_psq[s_psq_tail].len = len;
+                s_psq_tail = (s_psq_tail + 1) % PSQ;
+                e->state = PS_QUEUED;
+                s_spec_async++;
+                copy = NULL;
+                WakeConditionVariable(&s_psc_cv);
+            }
+            LeaveCriticalSection(&s_psc_cs);
+            free(copy);                          /* ring full: retried next draw */
+            if (e->state == PS_QUEUED)
+                xbox_PerfCount(XBOX_PERF_SHADERS_ASYNC, 1);
+            return NULL;
         }
-        if (err) ID3D10Blob_Release(err);
-        s_spec_ms += (now_ns() - t0) / 1e6;
-        return e->ps;
-        #undef EMIT_ARR
-        #undef EMIT
+        ps_compile(slot, src, (size_t)(o - src), 0);
+        return e->state == PS_READY ? e->ps : NULL;
     }
 }
 
@@ -1856,9 +2067,9 @@ static void be_flip(void)
                     s_st.gpu_frames ? s_st.gpu_ns / 1e6 / s_st.gpu_frames : 0.0,
                     s_st.tex_up, s_st.tex_up_bytes / 1048576.0, s_st.rt_alias);
             gprof_report();
-            if (s_spec_compiled || s_spec_failed)
-                fprintf(stderr, "[D3D11] specialised pixel shaders: %u compiled (%.0f ms total), %u failed\n",
-                        s_spec_compiled, s_spec_ms, s_spec_failed);
+            if (s_spec_compiled || s_spec_failed || s_spec_loaded)
+                fprintf(stderr, "[D3D11] specialised pixel shaders: %u from the cache, %u compiled (%u in the background, %.0f ms total), %u failed\n",
+                        s_spec_loaded, s_spec_compiled, s_spec_async, s_spec_ms, s_spec_failed);
             memset(&s_st, 0, sizeof s_st);
             last = n;
             g_hitz_heavy = 0;

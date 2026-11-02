@@ -31,6 +31,10 @@ GAME = PROJ / "game"
 GEN = PROJ / "src" / "recomp" / "gen"
 PATCH = ROOT / "xboxrecomp-hitz.patch"
 TOOLKIT_URL = "https://github.com/sp00nznet/xboxrecomp.git"
+# SDL2 runtime (one DLL) for non-Xbox controllers: 8BitDo, PlayStation,
+# Switch Pro. Pinned and checked; the game runs without it (XInput only).
+SDL2_URL = "https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10-win32-x64.zip"
+SDL2_SHA256 = "6cf9706eefd0a4a06dc764007934d428afaf029fabdd408a9e646048c91e18fb"
 TITLE_ID = 0x4D57001A
 IS_WIN = os.name == "nt"
 
@@ -267,6 +271,45 @@ def step_build():
     return True
 
 
+def step_extras():
+    """SDL2.dll next to the exe, and the launcher in hitz_pro/."""
+    import io
+    import urllib.request
+    import zipfile
+    say("Controller support (SDL2) and the launcher")
+    build = PROJ / "build"
+    dll = build / "SDL2.dll"
+    if dll.exists():
+        print("  SDL2.dll already there")
+    else:
+        cache = ROOT / ".tools" / "SDL2-2.32.10-win32-x64.zip"
+        try:
+            if not cache.exists():
+                print("  downloading " + SDL2_URL, flush=True)
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                with urllib.request.urlopen(SDL2_URL, timeout=60) as r:
+                    data = r.read()
+                cache.write_bytes(data)
+            data = cache.read_bytes()
+            if hashlib.sha256(data).hexdigest() != SDL2_SHA256:
+                cache.unlink()
+                raise RuntimeError("checksum mismatch (download corrupted?)")
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                dll.write_bytes(z.read("SDL2.dll"))
+            print("  SDL2.dll installed: 8BitDo, PlayStation and Switch Pro controllers work")
+        except Exception as e:
+            print("  [warning] could not get SDL2.dll (%s).\n"
+                  "  The game still runs; only Xbox (XInput) controllers will work.\n"
+                  "  Rerun setup.bat to try again." % e)
+    exe = build / "hitz_launcher.exe"
+    if exe.exists():
+        try:
+            shutil.copy2(exe, PROJ / "HitzLauncher.exe")
+            print("  launcher: hitz_pro\\HitzLauncher.exe")
+        except OSError as e:
+            print("  [warning] could not copy the launcher (%s); close it and rerun setup.bat" % e)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Set up, patch, generate and build the NHL Hitz Pro recomp.")
     ap.add_argument("--iso", help="NHL Hitz Pro (USA) disc image (.iso, xiso or full redump)")
@@ -280,9 +323,12 @@ def main():
     step_game(a.iso, a.game)
     step_generate(a.regen)
     built = False if a.no_build else step_build()
+    if built:
+        step_extras()
     say("Done in %.0f min" % ((time.time() - t0) / 60))
     if built:
-        print("  Play: hitz_pro\\run_hitz.bat")
+        print("  Play: hitz_pro\\HitzLauncher.exe  (settings, then Play)")
+        print("    or: hitz_pro\\run_hitz.bat       (straight in, default settings)")
         if a.run:
             subprocess.Popen(["cmd", "/c", str(PROJ / "run_hitz.bat")], cwd=PROJ)
 
