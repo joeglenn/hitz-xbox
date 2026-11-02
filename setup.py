@@ -78,17 +78,75 @@ def step_toolkit():
     head = git("rev-parse", "HEAD").stdout.strip()
     applied = git("apply", "--reverse", "--check", PATCH, check=False).returncode == 0
     if head == base and applied:
+        remember_patch()
         print("  already patched")
         return
-    dirty = git("status", "--porcelain", "--untracked-files=no").stdout.strip()
-    if dirty:
-        die("xboxrecomp/ has local changes that are not this patch.\n"
-            "    Commit or discard them (git -C xboxrecomp checkout -- .) and rerun.")
+    if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+        # After a git pull the toolkit still carries the previous version of
+        # our patch. Take it off again if it is one of ours; anything else is
+        # someone's own edit and is left alone.
+        if not remove_old_patch():
+            die("xboxrecomp/ has local changes that are not from this repo's patch.\n"
+                "    Commit or discard them (git -C xboxrecomp checkout -- .) and rerun.")
     git("checkout", "-q", base, quiet=False)
     if git("apply", "--check", PATCH, check=False).returncode != 0:
         die("the patch does not apply to %s; is xboxrecomp-hitz.patch from this repo?" % base[:7])
     git("apply", PATCH, quiet=False)
+    remember_patch()
     print("  patched")
+
+
+# The patch last applied, kept inside xboxrecomp/.git (not part of the tree).
+def applied_copy():
+    return TOOLKIT / ".git" / "hitz-applied.patch"
+
+
+def remember_patch():
+    try:
+        shutil.copyfile(PATCH, applied_copy())
+    except OSError:
+        pass
+
+
+def earlier_patches():
+    """Earlier versions of the patch: the copy saved when it was applied, then
+    every version in this repo's history (a ZIP download has none)."""
+    if applied_copy().exists():
+        yield "the last applied patch", applied_copy().read_bytes()
+    if (ROOT / ".git").exists():
+        log = run(["git", "-C", ROOT, "log", "--format=%H", "--", PATCH.name],
+                  check=False, quiet=True)
+        for commit in (log.stdout or "").split():
+            show = subprocess.run(["git", "-C", str(ROOT), "show", "%s:%s" % (commit, PATCH.name)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            if show.returncode == 0 and show.stdout:
+                yield "the patch from commit %s" % commit[:7], show.stdout
+
+
+def remove_old_patch():
+    """Reverse whichever earlier patch is applied; True if the tree is clean after."""
+    tmp = ROOT / ".tools" / "old-toolkit.patch"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    seen = set()
+    try:
+        for what, data in earlier_patches():
+            h = hashlib.sha256(data).hexdigest()
+            if h in seen:
+                continue
+            seen.add(h)
+            tmp.write_bytes(data)
+            if git("apply", "--reverse", "--check", tmp, check=False).returncode != 0:
+                continue
+            git("apply", "--reverse", tmp)
+            if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+                git("apply", tmp)                   # not the whole story: put it back
+                continue
+            print("  removed %s (updating to the new one)" % what)
+            return True
+        return False
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 # ---------------------------------------------------------------- 2. game
