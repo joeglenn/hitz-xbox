@@ -11,8 +11,9 @@
  * flip each target drawn since the last flip is read back into guest memory,
  * so the toolkit's present path, screenshots and FB dumps keep working.
  *
- * HITZ_GPU_ADAPTER=<substring> picks the adapter (default: the first non-
- * Microsoft one). HITZ_GPU_CULL=1 enables hardware culling (the CPU path does
+ * HITZ_GPU_ADAPTER=<substring> picks the adapter (default: the hardware
+ * adapter with the most dedicated video memory, i.e. the discrete GPU on a
+ * laptop with two). HITZ_GPU_CULL=1 enables hardware culling (the CPU path does
  * not cull). Stats every 10 s as [D3D11].
  */
 #define COBJMACROS
@@ -911,6 +912,8 @@ static int init_device(void)
     IDXGIFactory1 *fac = NULL;
     IDXGIAdapter1 *pick = NULL, *a = NULL;
     const char *want = getenv("HITZ_GPU_ADAPTER");
+    SIZE_T pick_vram = 0;
+    int pick_named = 0;
     UINT i;
     HRESULT hr;
     ID3DBlob *vsb = NULL, *psb = NULL, *err = NULL;
@@ -926,10 +929,21 @@ static int init_device(void)
         WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, n, sizeof n, NULL, NULL);
         fprintf(stderr, "[D3D11] adapter %u: %s (vendor %04X%s)\n", i, n, d.VendorId,
                 (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? ", software" : "");
-        if (!pick && ((want && strstr(n, want))
-                      || (!want && d.VendorId != 0x1414 && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)))) {
-            pick = a;
-            strcpy(name, n);
+        fprintf(stderr, "[D3D11]   %u MB dedicated video memory\n",
+                (unsigned)(d.DedicatedVideoMemory >> 20));
+        /* A named adapter (the launcher's GPU choice) wins; otherwise the
+         * hardware adapter with the most video memory. Windows lists the
+         * integrated chip first on most laptops, and it is far too slow
+         * for a match (it was picked before: 29 fps, then a frozen picture). */
+        if (want && *want && strstr(n, want) && !pick_named) {
+            if (pick) IDXGIAdapter1_Release(pick);
+            pick = a; pick_named = 1; strcpy(name, n);
+            continue;
+        }
+        if (!pick_named && d.VendorId != 0x1414 && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+            && (!pick || d.DedicatedVideoMemory > pick_vram)) {
+            if (pick) IDXGIAdapter1_Release(pick);
+            pick = a; pick_vram = d.DedicatedVideoMemory; strcpy(name, n);
             continue;
         }
         IDXGIAdapter1_Release(a);
@@ -1951,7 +1965,14 @@ static void be_flip(void)
             for (i = 0; i < MAX_RT; i++) {
                 RT *r = &s_rt[i];
                 if (!r->tex || r->swizzled) continue;
-                if (pass == 1 && r->dirty && !sync && r->sampled_frame && r->sampled_frame + 120 > s_frame) {
+                /* A target the GPU also samples stays on the GPU (no copy-out)
+                 * unless it is full-screen: those can be the frame on screen,
+                 * which the window reads from guest memory. Skipping them
+                 * froze the picture on "LOADING" through the pre-game intro
+                 * (the game samples the frame it presents) while the match
+                 * ran and played sound. */
+                if (pass == 1 && r->dirty && !sync && r->sampled_frame && r->sampled_frame + 120 > s_frame
+                    && !(r->w >= 640 && r->h >= 448)) {
                     r->dirty = 0;                /* a GPU-side target (sampled): no copy-out */
                     s_st.rt_skipped++;
                     continue;
