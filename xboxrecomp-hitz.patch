@@ -820,7 +820,7 @@ index 5975014..89ffce6 100644
  
  /* ======================================================================== */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 10d00f4..c964cfd 100644
+index 10d00f4..2de4709 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -30,6 +30,7 @@
@@ -1019,7 +1019,7 @@ index 10d00f4..c964cfd 100644
          }
      }
  
-@@ -10914,7 +11039,29 @@ static void kernel_thunk_dispatch_body(void)
+@@ -10914,7 +11039,31 @@ static void kernel_thunk_dispatch_body(void)
      }
  
      if (bridge) {
@@ -1038,6 +1038,8 @@ index 10d00f4..c964cfd 100644
 +            uint32_t caller = g_xbox_kernel_caller;
 +            bridge();
 +            dt = xbox_HostNowNs() - t0;
++            if (dt > 500000u)
++                xbox_PerfCount(XBOX_PERF_KERNEL_MS, dt / 1e6);
 +            if (dt > 8000000u) {
 +                static volatile LONG said;
 +                if (InterlockedIncrement(&said) <= 300)
@@ -2070,10 +2072,10 @@ index 334a9ed..67aa407 100644
      ${CMAKE_CURRENT_SOURCE_DIR}
 diff --git a/src/platform/perf_log.c b/src/platform/perf_log.c
 new file mode 100644
-index 0000000..6568c5b
+index 0000000..66e0300
 --- /dev/null
 +++ b/src/platform/perf_log.c
-@@ -0,0 +1,405 @@
+@@ -0,0 +1,431 @@
 +/*
 + * perf_log.c - see perf_log.h.
 + */
@@ -2110,6 +2112,7 @@ index 0000000..6568c5b
 +static struct {
 +    uint64_t start, frames, hitches, hitch_lines, judders, shown[HIST_MAX + 1];
 +    double   min_ms, max_ms, shaders, shader_ms, shaders_async, tex, tex_bytes;
++    double   work[5], work_max[5];   /* tex, hash, draw, flush, kernel ms */
 +} s_per;
 +
 +/* Whole run. */
@@ -2313,13 +2316,21 @@ index 0000000..6568c5b
 +        if (s_per.shown[i])
 +            o += _snprintf_s(hist + o, sizeof hist - o, _TRUNCATE, "%s%dx:%llu",
 +                             o ? " " : "", i, (unsigned long long)s_per.shown[i]);
-+    line(now, "%5.1f fps | frame %.1f-%.1f ms | hitches %llu | display %.2f Hz %s | "
-+              "shown %s | shaders %.0f (%.0f ms)%s | textures %.0f (%.1f MB)",
-+         sec > 0 ? (double)s_per.frames / sec : 0.0,
-+         s_per.frames ? s_per.min_ms : 0.0, s_per.frames ? s_per.max_ms : 0.0,
-+         (unsigned long long)s_per.hitches, s_hz, lock,
-+         o ? hist : "-", s_per.shaders, s_per.shader_ms,
-+         s_per.shaders_async > 0 ? " +bg" : "", s_per.tex, s_per.tex_bytes / 1048576.0);
++    {
++        double n = s_per.frames ? (double)s_per.frames : 1.0;
++        line(now, "%5.1f fps | frame %.1f-%.1f ms | hitches %llu | display %.2f Hz %s | "
++                  "shown %s | shaders %.0f (%.0f ms)%s | textures %.0f (%.1f MB) | "
++                  "ms/frame avg (max): tex %.2f (%.1f) hash %.2f (%.1f) draw %.2f (%.1f) "
++                  "flush %.2f (%.1f) kernel %.2f (%.1f)",
++             sec > 0 ? (double)s_per.frames / sec : 0.0,
++             s_per.frames ? s_per.min_ms : 0.0, s_per.frames ? s_per.max_ms : 0.0,
++             (unsigned long long)s_per.hitches, s_hz, lock,
++             o ? hist : "-", s_per.shaders, s_per.shader_ms,
++             s_per.shaders_async > 0 ? " +bg" : "", s_per.tex, s_per.tex_bytes / 1048576.0,
++             s_per.work[0] / n, s_per.work_max[0], s_per.work[1] / n, s_per.work_max[1],
++             s_per.work[2] / n, s_per.work_max[2], s_per.work[3] / n, s_per.work_max[3],
++             s_per.work[4] / n, s_per.work_max[4]);
++    }
 +    if (s_per.hitch_lines > HITCH_LINES)
 +        line(now, "  (%llu more hitches in this period not listed)",
 +             (unsigned long long)(s_per.hitch_lines - HITCH_LINES));
@@ -2347,6 +2358,14 @@ index 0000000..6568c5b
 +        s_per.shaders_async += s_cnt[XBOX_PERF_SHADERS_ASYNC];
 +        s_per.tex += s_cnt[XBOX_PERF_TEXTURES];
 +        s_per.tex_bytes += s_cnt[XBOX_PERF_TEX_BYTES];
++        {
++            int w;
++            for (w = 0; w < 5; w++) {
++                double v = s_cnt[XBOX_PERF_TEX_MS + w];
++                s_per.work[w] += v;
++                if (v > s_per.work_max[w]) s_per.work_max[w] = v;
++            }
++        }
 +        /* A hitch: clearly longer than the recent steady cadence (so a menu
 +         * that runs at 30 fps on purpose is not a hitch every frame), and
 +         * longer than a 60 Hz frame and a half in any case. */
@@ -2364,12 +2383,21 @@ index 0000000..6568c5b
 +                    if (s_files_dropped)
 +                        _snprintf_s(files + o, sizeof files - o, _TRUNCATE, " +%d more",
 +                                    s_files_dropped);
-+                    line(now, "HITCH frame %llu took %.1f ms (usual %.1f) | shaders %.0f (%.1f ms) "
-+                              "| textures %.0f (%.1f MB)%s%s",
-+                         (unsigned long long)s_frames, ms, med, s_cnt[XBOX_PERF_SHADERS],
-+                         s_cnt[XBOX_PERF_SHADER_MS], s_cnt[XBOX_PERF_TEXTURES],
-+                         s_cnt[XBOX_PERF_TEX_BYTES] / 1048576.0,
-+                         s_nfiles ? " | files: " : "", files);
++                    {
++                        double known = s_cnt[XBOX_PERF_SHADER_MS] + s_cnt[XBOX_PERF_TEX_MS]
++                                     + s_cnt[XBOX_PERF_HASH_MS] + s_cnt[XBOX_PERF_DRAW_MS]
++                                     + s_cnt[XBOX_PERF_FLUSH_MS] + s_cnt[XBOX_PERF_KERNEL_MS];
++                        line(now, "HITCH frame %llu took %.1f ms (usual %.1f) | shaders %.0f (%.1f ms) "
++                                  "| textures %.0f (%.1f MB) | ms: tex %.1f, hash %.1f, draw %.1f, "
++                                  "flush %.1f, kernel %.1f, rest %.1f (game code + waits)%s%s",
++                             (unsigned long long)s_frames, ms, med, s_cnt[XBOX_PERF_SHADERS],
++                             s_cnt[XBOX_PERF_SHADER_MS], s_cnt[XBOX_PERF_TEXTURES],
++                             s_cnt[XBOX_PERF_TEX_BYTES] / 1048576.0,
++                             s_cnt[XBOX_PERF_TEX_MS], s_cnt[XBOX_PERF_HASH_MS],
++                             s_cnt[XBOX_PERF_DRAW_MS], s_cnt[XBOX_PERF_FLUSH_MS],
++                             s_cnt[XBOX_PERF_KERNEL_MS], ms - known > 0 ? ms - known : 0.0,
++                             s_nfiles ? " | files: " : "", files);
++                    }
 +                }
 +                if (ms > s_worst_ms) {
 +                    s_worst_ms = ms;
@@ -2481,10 +2509,10 @@ index 0000000..6568c5b
 +#endif
 diff --git a/src/platform/perf_log.h b/src/platform/perf_log.h
 new file mode 100644
-index 0000000..4e56aef
+index 0000000..1eb7669
 --- /dev/null
 +++ b/src/platform/perf_log.h
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,73 @@
 +/*
 + * perf_log.h - a human-readable timing log for chasing stutter.
 + *
@@ -2522,6 +2550,12 @@ index 0000000..4e56aef
 +    XBOX_PERF_SHADERS_ASYNC,    /* shaders handed to the background compiler */
 +    XBOX_PERF_TEXTURES,         /* textures uploaded */
 +    XBOX_PERF_TEX_BYTES,        /* ... and their size */
++    /* Where a frame's time went, in milliseconds. */
++    XBOX_PERF_TEX_MS,           /* converting + uploading new textures */
++    XBOX_PERF_HASH_MS,          /* checking cached textures for changes */
++    XBOX_PERF_DRAW_MS,          /* building draws (CPU side) */
++    XBOX_PERF_FLUSH_MS,         /* submitting to the GPU + reading frames back */
++    XBOX_PERF_KERNEL_MS,        /* kernel calls over 0.5 ms (files, memory...) */
 +    XBOX_PERF_COUNTERS
 +};
 +

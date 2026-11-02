@@ -67,6 +67,7 @@ volatile int g_hitz_heavy;
 /* ------------------------------------------------------------ statistics */
 static struct { unsigned long long draws, vsh_draws, tris, tex_up, tex_up_bytes, rt_reads, rt_alias, flips;
                 unsigned long long t_draw_ns, t_flip_ns, t_map_ns, gpu_ns, gpu_frames, rt_skipped, rb_late; } s_st;
+static unsigned long long s_frame_draw_ns;   /* draw building since the last report */
 static unsigned long long now_ns(void)
 {
     static LARGE_INTEGER f;
@@ -651,6 +652,7 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
     D3D11_TEXTURE2D_DESC td;
     D3D11_SUBRESOURCE_DATA sd[6];
     uint32_t faces = t->cube ? 6 : 1, f;
+    unsigned long long t_up0 = 0;
 
     *is_cube = 0;
     rt = rt_find_key(key);
@@ -667,8 +669,10 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
             if (x->key == key && x->w == t->width && x->h == t->height && x->color == t->color
                 && x->pitch == t->pitch && x->cube == t->cube && x->palette == t->palette) {
                 if (x->hashed_frame != s_frame) {
+                    unsigned long long th = now_ns();
                     hash = hash_mem(GUEST(t->offset), t->bytes);
                     if (t->palette) hash ^= hash_mem(GUEST(t->palette), 1024) * 31;
+                    xbox_PerfCount(XBOX_PERF_HASH_MS, (now_ns() - th) / 1e6);
                     have_hash = 1;
                     x->hashed_frame = s_frame;
                     if (x->hash != hash) {        /* contents changed: re-upload */
@@ -693,6 +697,7 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
         tex_drop(lru);
         slot = lru;
     }
+    t_up0 = now_ns();
     if (!have_hash) {
         hash = hash_mem(GUEST(t->offset), t->bytes);
         if (t->palette) hash ^= hash_mem(GUEST(t->palette), 1024) * 31;
@@ -729,6 +734,7 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
         s_st.tex_up_bytes += (unsigned long long)t->width * t->height * faces * 4;
         xbox_PerfCount(XBOX_PERF_TEXTURES, 1);
         xbox_PerfCount(XBOX_PERF_TEX_BYTES, (double)t->width * t->height * faces * 4);
+        xbox_PerfCount(XBOX_PERF_TEX_MS, (now_ns() - t_up0) / 1e6);
         *is_cube = (int)t->cube;
         return x->srv;
     }
@@ -1836,7 +1842,11 @@ static void be_draw_x(const Nv2aSurface *s, const Nv2aBatchX *b)
     s_q[s_qn++] = qd;
     s_st.draws++;
     s_st.tris += b->count / 3;
-    s_st.t_draw_ns += now_ns() - t0;
+    {
+        unsigned long long dt = now_ns() - t0;
+        s_st.t_draw_ns += dt;
+        s_frame_draw_ns += dt;
+    }
 }
 
 /* Program batches: raw attribute ranges (overlapping ranges of an
@@ -1934,7 +1944,11 @@ static void be_draw_vsh(const Nv2aSurface *s, const Nv2aBatchVsh *b)
     s_st.draws++;
     s_st.vsh_draws++;
     s_st.tris += b->icount / 3;
-    s_st.t_draw_ns += now_ns() - t0;
+    {
+        unsigned long long dt = now_ns() - t0;
+        s_st.t_draw_ns += dt;
+        s_frame_draw_ns += dt;
+    }
 }
 
 static uint16_t argb_to_565(uint32_t c)
@@ -2088,6 +2102,9 @@ static void be_flip(void)
     s_frame++;
     s_st.flips++;
     s_st.t_flip_ns += now_ns() - t0;
+    xbox_PerfCount(XBOX_PERF_FLUSH_MS, (now_ns() - t0) / 1e6);
+    xbox_PerfCount(XBOX_PERF_DRAW_MS, s_frame_draw_ns / 1e6);
+    s_frame_draw_ns = 0;
     {
         static unsigned long long last;
         unsigned long long n = now_ns();
