@@ -377,3 +377,10 @@ Four read-only reviewers over the pushed heads (toolkit patch, project + setup, 
 - Launcher: CB_GETLBTEXT length-checked (a long adapter name could overflow the 128-char buffer); `--set` rejects values with line breaks (INI corruption); path truncation is an error instead of a wrong path; WM_DPICHANGED re-lays out the controls and font when the window moves between monitors with different scale factors; "Open log folder" opens the folder directly.
 - Docs: README gains HITZ_GPU_CULL, HITZ_GPU_READBACK_POLL, the pad-port default; CLAUDE.md phase table gains the polish row.
 - Verified in the VM: full rebuild 0 warnings in our files; attract demo 150 s (60 fps, late 0, every 10 s screenshot differs); launcher Play -> game running with its INI; the bare exe with no environment comes up on the GPU in a window at 60 fps.
+
+## 2026-11-04: in-match texture hitches
+
+Player's perf log (RTX 4090 laptop, 280 s fullscreen): 12 in-match hitches of 26-44 ms, `tex` 8-26 ms of each -- new textures streamed during play, 1-3 MB at a time. The renderer decoded every texture texel by texel through the toolkit's sampler (wrap, border and format switch per texel).
+- DXT1/3/5 (most of the game's textures) now go to the GPU as BC1/2/3 unchanged: no CPU decode, 1/4-1/8 the upload. Top level must be whole 4x4 blocks, else the old path.
+- The uncompressed formats still seen (swizzled A1R5G5B5/A8R8G8B8 in matches, linear YUY2 movie frames, LIN_A8R8G8B8) get a row-at-a-time decoder: separable Morton tables for the swizzle, the same channel expansion and BT.601 maths as the toolkit. `HITZ_TEX_VERIFY=1` compared it with the toolkit's decoder: identical for every format seen (0 texels differ).
+- VM attract demo, 220 s: hitches 18 -> 12; in-match `tex` 45.5/8.0/12.2/8.7 ms -> 0.9/0.1/6.0/3.9 ms; movie frames 1.7 -> 0.7 ms each. Screenshots: ice markings, board ads, crowd, players, logos and the DEMO overlay's transparency all correct. What remains in those frames is the game's own loading code (`rest`).

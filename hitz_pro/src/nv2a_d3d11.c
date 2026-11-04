@@ -33,6 +33,7 @@
 #include <string.h>
 #include <stddef.h>
 #include "nv2a_backend.h"
+#include "d3d/d3d8_swizzle.h"
 #include "platform/perf_log.h"
 static void psc_init(void);           /* the shader cache, defined below */
 
@@ -70,7 +71,7 @@ static uint32_t s_frame = 1;
 volatile int g_hitz_heavy;
 
 /* ------------------------------------------------------------ statistics */
-static struct { unsigned long long draws, vsh_draws, tris, tex_up, tex_up_bytes, rt_reads, rt_alias, flips;
+static struct { unsigned long long draws, vsh_draws, tris, tex_up, tex_up_bytes, tex_bc, tex_fast, tex_ms_cpu, rt_reads, rt_alias, flips;
                 unsigned long long t_draw_ns, t_flip_ns, t_map_ns, gpu_ns, gpu_frames, rt_skipped, rb_late; } s_st;
 static unsigned long long s_frame_draw_ns;   /* draw building since the last report */
 static unsigned long long now_ns(void)
@@ -633,6 +634,7 @@ static void tex_drop(uint32_t i)                 /* release and unlink */
 }
 static uint32_t *s_decode;
 static size_t s_decode_cap;
+static int s_fast_off = -1, s_tex_verify = -1;   /* HITZ_GPU_FASTDECODE=0, HITZ_TEX_VERIFY=1 */
 
 static uint64_t hash_mem(const uint8_t *p, size_t n)
 {
@@ -648,6 +650,98 @@ static uint64_t hash_mem(const uint8_t *p, size_t n)
     return h;
 }
 
+/* Decode the common uncompressed formats straight from guest memory, as
+ * the toolkit's per-texel sampler would (same channel expansion, same BT.601
+ * YUY2 maths), but a row at a time: the per-texel path (wrap, border, format
+ * switch for each texel) cost ~2 ms per 640x480 movie frame and several ms
+ * per in-match 256x256. Swizzled offsets are separable -- the Morton offset
+ * of (x, y) is offset(x, 0) | offset(0, y) -- so two small tables do it.
+ * Returns 0 for anything else (the caller uses the toolkit's decoder). */
+static int fast_decode(const Nv2aStage *t, uint32_t *out)
+{
+    static uint32_t *ox, *oy;
+    static uint32_t ox_cap, oy_cap;
+    uint32_t fmt = t->color, w = t->width, h = t->height, x, y, bpp, swz;
+    const uint8_t *m = GUEST(t->offset);
+    if (t->cube || t->palette || !w || !h) return 0;
+    switch (fmt) {
+    case 0x02: case 0x04: case 0x05: case 0x03: bpp = 2; swz = 1; break;
+    case 0x06: case 0x07:                       bpp = 4; swz = 1; break;
+    case 0x10: case 0x11: case 0x1C: case 0x1D: bpp = 2; swz = 0; break;
+    case 0x12: case 0x1E:                       bpp = 4; swz = 0; break;
+    case 0x24: case 0x25:                       bpp = 2; swz = 0; break;
+    default: return 0;
+    }
+    if (!swz && t->pitch < w * bpp) return 0;
+    if (swz) {
+        if (w > ox_cap) { free(ox); ox = (uint32_t *)malloc(w * 4); ox_cap = ox ? w : 0; }
+        if (h > oy_cap) { free(oy); oy = (uint32_t *)malloc(h * 4); oy_cap = oy ? h : 0; }
+        if (!ox || !oy) return 0;
+        for (x = 0; x < w; x++) ox[x] = swz_offset(x, 0, w, h);
+        for (y = 0; y < h; y++) oy[y] = swz_offset(0, y, w, h);
+    }
+    for (y = 0; y < h; y++) {
+        uint32_t *d = out + (size_t)y * w;
+        const uint8_t *row = swz ? m : m + (size_t)y * t->pitch;
+        #define IDX(x_) (swz ? (ox[x_] | oy[y]) : (x_))
+        switch (fmt) {
+        case 0x06: case 0x12:
+            if (!swz) { memcpy(d, row, (size_t)w * 4); break; }
+            for (x = 0; x < w; x++) d[x] = ((const uint32_t *)row)[IDX(x)];
+            break;
+        case 0x07: case 0x1E:
+            for (x = 0; x < w; x++) d[x] = ((const uint32_t *)row)[IDX(x)] | 0xFF000000u;
+            break;
+        case 0x02: case 0x10:
+            for (x = 0; x < w; x++) {
+                uint32_t v = ((const uint16_t *)row)[IDX(x)];
+                d[x] = ((v & 0x8000u) ? 0xFF000000u : 0u) | (d3d8_expand_channel((v >> 10) & 0x1F, 5) << 16)
+                     | (d3d8_expand_channel((v >> 5) & 0x1F, 5) << 8) | d3d8_expand_channel(v & 0x1F, 5);
+            }
+            break;
+        case 0x03: case 0x1C:
+            for (x = 0; x < w; x++) {
+                uint32_t v = ((const uint16_t *)row)[IDX(x)];
+                d[x] = 0xFF000000u | (d3d8_expand_channel((v >> 10) & 0x1F, 5) << 16)
+                     | (d3d8_expand_channel((v >> 5) & 0x1F, 5) << 8) | d3d8_expand_channel(v & 0x1F, 5);
+            }
+            break;
+        case 0x05: case 0x11:
+            for (x = 0; x < w; x++) {
+                uint32_t v = ((const uint16_t *)row)[IDX(x)];
+                d[x] = 0xFF000000u | (d3d8_expand_channel((v >> 11) & 0x1F, 5) << 16)
+                     | (d3d8_expand_channel((v >> 5) & 0x3F, 6) << 8) | d3d8_expand_channel(v & 0x1F, 5);
+            }
+            break;
+        case 0x04: case 0x1D:
+            for (x = 0; x < w; x++) {
+                uint32_t v = ((const uint16_t *)row)[IDX(x)];
+                d[x] = (d3d8_expand_channel((v >> 12) & 0x0F, 4) << 24) | (d3d8_expand_channel((v >> 8) & 0x0F, 4) << 16)
+                     | (d3d8_expand_channel((v >> 4) & 0x0F, 4) << 8) | d3d8_expand_channel(v & 0x0F, 4);
+            }
+            break;
+        case 0x24: case 0x25: {
+            uint32_t yoff = fmt == 0x24 ? 0u : 1u;
+            for (x = 0; x < w; x++) {
+                const uint8_t *g = row + (size_t)(x & ~1u) * 2;
+                int c = (int)g[(x & 1u) ? 2 + yoff : yoff] - 16;
+                int cu = (int)g[1 - yoff] - 128, cv = (int)g[3 - yoff] - 128;
+                int r = (298 * c + 409 * cv + 128) >> 8;
+                int gg = (298 * c - 100 * cu - 208 * cv + 128) >> 8;
+                int b = (298 * c + 516 * cu + 128) >> 8;
+                r = r < 0 ? 0 : r > 255 ? 255 : r;
+                gg = gg < 0 ? 0 : gg > 255 ? 255 : gg;
+                b = b < 0 ? 0 : b > 255 ? 255 : b;
+                d[x] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)gg << 8) | (uint32_t)b;
+            }
+            break;
+        }
+        }
+        #undef IDX
+    }
+    return 1;
+}
+
 static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cube)
 {
     uint32_t key = KEY(t->offset), i, h, slot = MAX_TEX, lru = 0;
@@ -658,6 +752,7 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
     D3D11_SUBRESOURCE_DATA sd[6];
     uint32_t faces = t->cube ? 6 : 1, f;
     unsigned long long t_up0 = 0;
+    size_t up_bytes = 0;            /* what actually goes to the GPU */
 
     *is_cube = 0;
     rt = rt_find_key(key);
@@ -707,25 +802,88 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
         hash = hash_mem(GUEST(t->offset), t->bytes);
         if (t->palette) hash ^= hash_mem(GUEST(t->palette), 1024) * 31;
     }
-    {
-        size_t need = (size_t)t->width * t->height * faces;
-        if (need > s_decode_cap) {
-            free(s_decode);
-            s_decode = (uint32_t *)malloc(need * 4);
-            s_decode_cap = s_decode ? need : 0;
-        }
-        if (!s_decode || !nv2a_backend_decode_stage(st, s_decode))
-            return NULL;
-    }
     memset(&td, 0, sizeof td);
     td.Width = t->width; td.Height = t->height; td.MipLevels = 1; td.ArraySize = faces;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     td.MiscFlags = t->cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
-    for (f = 0; f < faces; f++) {
-        sd[f].pSysMem = s_decode + (size_t)t->width * t->height * f;
-        sd[f].SysMemPitch = t->width * 4;
-        sd[f].SysMemSlicePitch = 0;
+    {
+        /* DXT1/3/5 are the GPU's own BC1/2/3: hand the blocks over as they
+         * are instead of decoding every texel on the CPU (that decode was
+         * most of each in-match texture hitch: 10-26 ms for 1-3 MB). The
+         * Xbox stores the blocks row by row like D3D does; level 0 comes
+         * first, and cube faces are one face stride apart. BC needs the top
+         * level to be whole blocks; anything else takes the CPU path.
+         * HITZ_GPU_BC=0 turns it off. */
+        static int bc_on = -1;
+        if (s_fast_off < 0) { const char *e = getenv("HITZ_GPU_FASTDECODE"); s_fast_off = e && *e == '0'; }
+        if (s_tex_verify < 0) { const char *e = getenv("HITZ_TEX_VERIFY"); s_tex_verify = e && *e == '1'; }
+        uint32_t bb = 0;
+        DXGI_FORMAT bf = DXGI_FORMAT_UNKNOWN;
+        if (bc_on < 0) { const char *e = getenv("HITZ_GPU_BC"); bc_on = !(e && *e == '0'); }
+        switch (t->color) {
+        case 0x0C: bb = 8;  bf = DXGI_FORMAT_BC1_UNORM; break;   /* DXT1 */
+        case 0x0E: bb = 16; bf = DXGI_FORMAT_BC2_UNORM; break;   /* DXT3 */
+        case 0x0F: bb = 16; bf = DXGI_FORMAT_BC3_UNORM; break;   /* DXT5 */
+        default: break;
+        }
+        if (bc_on && bb && !(t->width & 3) && !(t->height & 3)
+            && (size_t)(t->width / 4) * (t->height / 4) * bb * faces <= t->bytes) {
+            const uint8_t *g = GUEST(t->offset);
+            size_t face_stride = faces > 1 ? t->bytes / 6 : 0;
+            td.Format = bf;
+            for (f = 0; f < faces; f++) {
+                sd[f].pSysMem = g + face_stride * f;
+                sd[f].SysMemPitch = (t->width / 4) * bb;
+                sd[f].SysMemSlicePitch = 0;
+            }
+            up_bytes = (size_t)(t->width / 4) * (t->height / 4) * bb * faces;
+            s_st.tex_bc++;
+        } else {
+            unsigned long long td0 = now_ns();
+            size_t need = (size_t)t->width * t->height * faces;
+            {   /* which formats still take the CPU path, and how much */
+                static unsigned fmt_n[256], fmt_px[256];
+                fmt_n[t->color & 255]++; fmt_px[t->color & 255] += t->width * t->height * faces;
+                if (getenv("HITZ_TEX_FMT_LOG") && (fmt_n[t->color & 255] & (fmt_n[t->color & 255] - 1)) == 0)
+                    fprintf(stderr, "[D3D11] cpu-decoded format 0x%02X: %u textures, %u kpx so far (last %ux%u%s%s)\n",
+                            t->color & 255, fmt_n[t->color & 255], fmt_px[t->color & 255] / 1000, t->width, t->height,
+                            t->cube ? " cube" : "", t->palette ? " palette" : "");
+            }
+            if (need > s_decode_cap) {
+                free(s_decode);
+                s_decode = (uint32_t *)malloc(need * 4);
+                s_decode_cap = s_decode ? need : 0;
+            }
+            if (!s_decode)
+                return NULL;
+            if (!s_fast_off && fast_decode(t, s_decode)) {
+                s_st.tex_fast++;
+                if (s_tex_verify > 0) {
+                    /* HITZ_TEX_VERIFY=1: the toolkit's decoder must agree. */
+                    static unsigned checked[256];
+                    if (checked[t->color & 255]++ < 8) {
+                        uint32_t *ref = (uint32_t *)malloc(need * 4);
+                        if (ref && nv2a_backend_decode_stage(st, ref)) {
+                            size_t i, bad = 0;
+                            for (i = 0; i < need; i++) bad += ref[i] != s_decode[i];
+                            fprintf(stderr, "[D3D11] fast decode check: format 0x%02X %ux%u %s (%zu of %zu texels differ)\n",
+                                    t->color & 255, t->width, t->height, bad ? "MISMATCH" : "identical", bad, need);
+                        }
+                        free(ref);
+                    }
+                }
+            } else if (!nv2a_backend_decode_stage(st, s_decode)) {
+                return NULL;
+            }
+            for (f = 0; f < faces; f++) {
+                sd[f].pSysMem = s_decode + (size_t)t->width * t->height * f;
+                sd[f].SysMemPitch = t->width * 4;
+                sd[f].SysMemSlicePitch = 0;
+            }
+            up_bytes = need * 4;
+            s_st.tex_ms_cpu += now_ns() - td0;
+        }
     }
     {
         Tex *x = &s_tex[slot];
@@ -736,9 +894,9 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
         x->hashed_frame = x->last_frame = s_frame;
         tex_link(slot);
         s_st.tex_up++;
-        s_st.tex_up_bytes += (unsigned long long)t->width * t->height * faces * 4;
+        s_st.tex_up_bytes += up_bytes;
         xbox_PerfCount(XBOX_PERF_TEXTURES, 1);
-        xbox_PerfCount(XBOX_PERF_TEX_BYTES, (double)t->width * t->height * faces * 4);
+        xbox_PerfCount(XBOX_PERF_TEX_BYTES, (double)up_bytes);
         xbox_PerfCount(XBOX_PERF_TEX_MS, (now_ns() - t_up0) / 1e6);
         *is_cube = (int)t->cube;
         return x->srv;
@@ -2099,7 +2257,7 @@ static void be_flip(void)
         if (n - last > 10000000000ull) {
             double sec = (n - last) / 1e9;
             fprintf(stderr, "[D3D11] %.1f fps | %.0f draws/frame (%.0f gpu-vsh), %.0f tris/frame | draw cpu %.1f ms/frame, "
-                            "flip %.1f ms/frame (map wait %.1f, late %llu, gpu-only %llu) | gpu %.1f ms/frame | tex uploads %llu (%.1f MB), rt-as-texture %llu\n",
+                            "flip %.1f ms/frame (map wait %.1f, late %llu, gpu-only %llu) | gpu %.1f ms/frame | tex uploads %llu (%llu compressed, %llu fast, %.1f MB; cpu decode %.1f ms), rt-as-texture %llu\n",
                     s_st.flips / sec, s_st.flips ? (double)s_st.draws / s_st.flips : 0.0,
                     s_st.flips ? (double)s_st.vsh_draws / s_st.flips : 0.0,
                     s_st.flips ? (double)s_st.tris / s_st.flips : 0.0,
@@ -2107,7 +2265,7 @@ static void be_flip(void)
                     s_st.flips ? s_st.t_flip_ns / 1e6 / s_st.flips : 0.0,
                     s_st.flips ? s_st.t_map_ns / 1e6 / s_st.flips : 0.0, s_st.rb_late, s_st.rt_skipped,
                     s_st.gpu_frames ? s_st.gpu_ns / 1e6 / s_st.gpu_frames : 0.0,
-                    s_st.tex_up, s_st.tex_up_bytes / 1048576.0, s_st.rt_alias);
+                    s_st.tex_up, s_st.tex_bc, s_st.tex_fast, s_st.tex_up_bytes / 1048576.0, s_st.tex_ms_cpu / 1e6, s_st.rt_alias);
             gprof_report();
             if (s_spec_compiled || s_spec_failed || s_spec_loaded)
                 fprintf(stderr, "[D3D11] specialised pixel shaders: %u from the cache, %u compiled (%u in the background, %.0f ms total), %u failed\n",

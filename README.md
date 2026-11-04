@@ -244,6 +244,9 @@ You only need these to change behaviour or to debug. `main.c` and `run_hitz.bat`
 | `RECOMP_USB_PADS=1..4` | number of controller ports (default 2; the launcher's Players setting) |
 | `RECOMP_KEYBOARD=1` | keyboard as pad 1 |
 | `HITZ_GPU_CULL=1` | back-face culling on the GPU (the CPU path never culled; try it if a scene looks wrong) |
+| `HITZ_GPU_BC=0` | decode DXT textures on the CPU instead of uploading them compressed (debug) |
+| `HITZ_GPU_FASTDECODE=0` | use the toolkit's per-texel decoder for uncompressed textures (debug) |
+| `HITZ_TEX_VERIFY=1` | check the fast decoder against the toolkit's for the first textures of each format |
 | `HITZ_GPU_READBACK_POLL=1` | old non-waiting frame readback (dropped/repeated frames on some drivers) |
 | `HITZ_PACING=timer` | don't lock the frame clock to the display (the old free-running 60 Hz) |
 | `HITZ_REFRESH_SWITCH=0` | never change the monitor's refresh rate in fullscreen |
