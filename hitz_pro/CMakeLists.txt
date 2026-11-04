@@ -88,6 +88,7 @@ set_source_files_properties(src/nv2a_d3d11.c PROPERTIES INCLUDE_DIRECTORIES "${X
 # Windows SDK libraries needed at link time
 target_link_libraries(${PROJECT_NAME} PRIVATE
     d3d11
+    d3dcompiler     # D3DCompile (nv2a_d3d11.c); not only MSVC's #pragma comment(lib)
     dxgi
     dxguid
     $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>   # see src/input/CMakeLists.txt

@@ -820,7 +820,7 @@ index 5975014..89ffce6 100644
  
  /* ======================================================================== */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 10d00f4..2de4709 100644
+index 10d00f4..5761c2d 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -30,6 +30,7 @@
@@ -967,7 +967,35 @@ index 10d00f4..2de4709 100644
      due = vblank_due(t0_ns, count);
      if (now_ns < due) {
          *next_due_ns = due;
-@@ -4255,6 +4367,8 @@ static NTSTATUS bridge_create_file_impl(
+@@ -3602,7 +3714,7 @@ typedef struct {
+ } XboxTimer;
+ static XboxTimer g_timers[XBOX_MAX_TIMERS];
+ static CRITICAL_SECTION g_timer_lock;
+-static int g_timer_started;
++static volatile LONG g_timer_started;   /* 0 never, 1 initialising, 2 ready */
+ 
+ /* Whether the timer thread runs the paced loop below (kernel_timer_loop_ns):
+  * only for what needs it, the 60 Hz vblank (RECOMP_VBLANK=paced) and the
+@@ -3806,10 +3918,16 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+     int i, free_slot = -1;
+     uint32_t was_set = 0;
+ 
+-    if (!g_timer_started) {
++    /* The first caller initialises; a second guest thread setting its first
++     * timer at the same moment waits for it instead of initialising the lock
++     * twice and starting a second timer thread. */
++    if (g_timer_started != 2 && InterlockedCompareExchange(&g_timer_started, 1, 0) == 0) {
+         InitializeCriticalSection(&g_timer_lock);
+-        g_timer_started = 1;
+         CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
++        InterlockedExchange(&g_timer_started, 2);
++    } else {
++        while (g_timer_started != 2)
++            Sleep(0);                           /* another thread is initialising */
+     }
+ 
+     EnterCriticalSection(&g_timer_lock);
+@@ -4255,6 +4373,8 @@ static NTSTATUS bridge_create_file_impl(
              fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X\n",
                      gpath, (unsigned)disposition, (unsigned)options,
                      g_xbox_kernel_caller, status);
@@ -976,7 +1004,7 @@ index 10d00f4..2de4709 100644
      }
      fflush(stderr);
      return st;
-@@ -4756,7 +4870,9 @@ static void bridge_NtReadFile(void)
+@@ -4756,7 +4876,9 @@ static void bridge_NtReadFile(void)
           * whatever precedes the file it actually wants, and a read that stops
           * early looks identical to one that never started -- until you can
           * see where each one landed. */
@@ -987,7 +1015,7 @@ index 10d00f4..2de4709 100644
              fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                      g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                      (long long)off.QuadPart, length, got,
-@@ -10840,10 +10956,15 @@ static void kernel_thunk_dispatch_body(void)
+@@ -10840,10 +10962,15 @@ static void kernel_thunk_dispatch_body(void)
      }
  
      {
@@ -1006,7 +1034,7 @@ index 10d00f4..2de4709 100644
              fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                      g_kernel_call_count, ordinal, slot, g_esp);
              /* And which ones, ranked. "Latest" names whatever the sample
-@@ -10869,7 +10990,11 @@ static void kernel_thunk_dispatch_body(void)
+@@ -10869,7 +10996,11 @@ static void kernel_thunk_dispatch_body(void)
                  }
              }
              fflush(stderr);
@@ -1019,7 +1047,7 @@ index 10d00f4..2de4709 100644
          }
      }
  
-@@ -10914,7 +11039,31 @@ static void kernel_thunk_dispatch_body(void)
+@@ -10914,7 +11045,31 @@ static void kernel_thunk_dispatch_body(void)
      }
  
      if (bridge) {
@@ -2668,7 +2696,7 @@ index bd00f3f..5f92255 100644
      const XBOX_GAMEPAD *g;
      uint8_t synth = synthetic_buttons();
 diff --git a/src/video/fb_present.c b/src/video/fb_present.c
-index 3430107..3864691 100644
+index 3430107..af0d28b 100644
 --- a/src/video/fb_present.c
 +++ b/src/video/fb_present.c
 @@ -28,6 +28,7 @@
@@ -2679,9 +2707,13 @@ index 3430107..3864691 100644
  #include <string.h>
  /* Which keys are down, for the pad stand-in in src/input: this window
   * records them in the shared key table (src/input/keyboard.c).
-@@ -63,6 +64,11 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
+@@ -61,8 +62,14 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
+  *
+  * Two buffers and an index, swapped after the copy completes, so the window
   * thread is never reading the one being filled. */
- static uint32_t     *s_present[2];
+-static uint32_t     *s_present[2];
++static uint32_t     *s_present[3];       /* published, being read, free */
++static volatile LONG s_reading = -1;      /* the one the window thread copies */
  static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
 +static HANDLE        s_new_frame;    /* set by each flip (auto-reset) */
 +static volatile LONG s_resized;      /* re-present: the client area changed */
@@ -2691,7 +2723,23 @@ index 3430107..3864691 100644
  
  /* The last PVIDEO frame shown. A frame stays on screen until the next one or
   * STOP, but once its bank is consumed the title may reuse the memory, so the
-@@ -198,6 +204,9 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+@@ -162,7 +169,14 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+         return;
+     if (getenv("RECOMP_FB_VA"))
+         return;                       /* pinned: leave the old path alone */
+-    next = (s_present_idx == 0) ? 1 : 0;
++    {
++        /* Neither the published frame nor the one the window thread is
++         * copying right now; with three buffers one is always free. */
++        LONG pub = s_present_idx, rd = s_reading;
++        next = 0;
++        while (next == pub || next == rd)
++            next++;
++    }
+     if (!s_present[next]) {
+         s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
+                                              4);
+@@ -198,22 +212,28 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
      }
      /* Published only once it is whole. */
      InterlockedExchange(&s_present_idx, next);
@@ -2701,7 +2749,26 @@ index 3430107..3864691 100644
  }
  
  /* Title bar, the way ps3recomp's window shows it. Written by the flip,
-@@ -242,7 +251,11 @@ static void fb_toggle_fullscreen(HWND h)
+  * read once a second by the window thread; a torn read shows one stale
+  * number for a second, which nobody can tell apart from a real one. */
+ static wchar_t       s_title[48] = L"Xbox Recomp";
++static SRWLOCK       s_title_lock = SRWLOCK_INIT;
+ static volatile LONG s_flips;
+ static volatile LONG s_frame_draws;
+ 
+ void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
+ {
+     int i;
++    AcquireSRWLockExclusive(&s_title_lock);
+     for (i = 0; i < max_chars && i < 47 && name[i]; i++)
+         s_title[i] = (wchar_t)name[i];
+     if (i)
+         s_title[i] = 0;
++    ReleaseSRWLockExclusive(&s_title_lock);
+ }
+ 
+ void xbox_FramebufferWindowFrameStats(uint32_t draws)
+@@ -242,7 +262,11 @@ static void fb_toggle_fullscreen(HWND h)
                       mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
                       SWP_FRAMECHANGED | SWP_SHOWWINDOW);
          full = 1;
@@ -2713,7 +2780,7 @@ index 3430107..3864691 100644
          SetWindowLongPtrA(h, GWL_STYLE, saved_style);
          SetWindowPos(h, NULL, saved.left, saved.top, saved.right - saved.left,
                       saved.bottom - saved.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW);
-@@ -261,6 +274,18 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+@@ -261,6 +285,18 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
      }
      if (m == WM_SYSKEYDOWN && w == VK_RETURN)
          return 0;                       /* auto-repeat of Alt+Enter */
@@ -2732,7 +2799,7 @@ index 3430107..3864691 100644
      switch (m) {
      case WM_CLOSE:
      case WM_DESTROY:
-@@ -275,6 +300,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+@@ -275,6 +311,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
          InterlockedExchange(&s_fb_running, 0);
          if (!getenv("RECOMP_CLOSE_KEEPS_RUNNING")) {
              fprintf(stderr, "  [FBWIN] window closed: exiting\n");
@@ -2740,7 +2807,7 @@ index 3430107..3864691 100644
              recomp_exit_hook_run("window");
              fflush(stdout);
              fflush(stderr);
-@@ -543,17 +569,39 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -543,24 +580,48 @@ static DWORD WINAPI fb_thread(LPVOID unused)
  
      fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
              s_fb_width, s_fb_height);
@@ -2784,7 +2851,16 @@ index 3430107..3864691 100644
              /* A finished frame, published by the flip. Copied into s_rgb so
               * the dump path and GDI see one consistent image even if the
               * next flip lands mid-blit. */
-@@ -601,13 +649,19 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+             LONG idx = s_present_idx;
++            InterlockedExchange(&s_reading, idx);
+             if (s_present[idx])
+                 memcpy(s_rgb, s_present[idx],
+                        (size_t)s_fb_width * s_fb_height * 4);
++            InterlockedExchange(&s_reading, -1);
+             if (!fb_pinned)
+                 fb_overlay();
+             paced = fb_show(hwnd, hdc, &bi);
+@@ -601,13 +662,23 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              static DWORD t0;
              static LONG f0;
              DWORD now = GetTickCount();
@@ -2792,7 +2868,12 @@ index 3430107..3864691 100644
 +            if (now - t0 >= 1000 || InterlockedExchange(&s_title_now, 0)) {
                  LONG f = s_flips;
                  wchar_t tb[128];
-                 _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
+-                _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
++                wchar_t title[48];
++                AcquireSRWLockShared(&s_title_lock);
++                wcscpy_s(title, 48, s_title);
++                ReleaseSRWLockShared(&s_title_lock);
++                _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", title,
                             t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
                             (long)s_frame_draws);
                  tb[127] = 0;
@@ -2805,7 +2886,7 @@ index 3430107..3864691 100644
                  SetWindowTextW(hwnd, tb);
                  t0 = now; f0 = f;
              }
-@@ -634,6 +688,9 @@ void xbox_FramebufferWindowStart(void)
+@@ -634,6 +705,9 @@ void xbox_FramebufferWindowStart(void)
          return;
      if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
          return;
@@ -2816,7 +2897,7 @@ index 3430107..3864691 100644
      if (th)
          CloseHandle(th);
 diff --git a/src/video/gpu_present.c b/src/video/gpu_present.c
-index 4e122b1..5a0b4eb 100644
+index 4e122b1..960ba0d 100644
 --- a/src/video/gpu_present.c
 +++ b/src/video/gpu_present.c
 @@ -3,11 +3,31 @@
@@ -3160,7 +3241,7 @@ index 4e122b1..5a0b4eb 100644
      D3D11_TEXTURE2D_DESC td;
      D3D11_SAMPLER_DESC smp;
      ID3DBlob *vsb, *psb;
-@@ -106,20 +390,16 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
+@@ -106,20 +390,19 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
      s_hwnd = hwnd;
      s_w = width; s_h = height;
      client_size(&s_bw, &s_bh);
@@ -3185,12 +3266,15 @@ index 4e122b1..5a0b4eb 100644
 +            fprintf(stderr, "  [D3D] flip-model swap chain unavailable (0x%08lX); using the blit model\n",
 +                    (unsigned long)hr);
 +        s_flip = 0;
++        if (s_chain) { IDXGISwapChain_Release(s_chain);        s_chain = NULL; }
++        if (s_ctx)   { ID3D11DeviceContext_Release(s_ctx);     s_ctx = NULL; }
++        if (s_dev)   { ID3D11Device_Release(s_dev);            s_dev = NULL; }
 +        hr = create_chain(0, hwnd);
 +    }
      if (FAILED(hr)) {
          fprintf(stderr, "  [D3D] device/swap chain failed (0x%08lX); staying on GDI\n",
                  (unsigned long)hr);
-@@ -130,10 +410,26 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
+@@ -130,10 +413,26 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
           * not DXGI's exclusive mode at 640x480. */
          IDXGIFactory *fac = NULL;
          if (SUCCEEDED(IDXGISwapChain_GetParent(s_chain, &IID_IDXGIFactory, (void **)&fac))) {
@@ -3217,7 +3301,7 @@ index 4e122b1..5a0b4eb 100644
      ZeroMemory(&td, sizeof td);
      td.Width = width; td.Height = height; td.MipLevels = 1; td.ArraySize = 1;
      td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
-@@ -161,12 +457,44 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
+@@ -161,12 +460,44 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
      }
      ID3D10Blob_Release(vsb);
      ID3D10Blob_Release(psb);
@@ -3264,7 +3348,7 @@ index 4e122b1..5a0b4eb 100644
  /* Returns 0 when nothing was shown: the window is occluded or the display
   * is off, and Present does not wait for vsync then -- the caller must pace
   * itself instead of spinning. The pixels are read before this returns. */
-@@ -176,6 +504,7 @@ int gpu_present_frame(const uint32_t *pixels)
+@@ -176,6 +507,7 @@ int gpu_present_frame(const uint32_t *pixels)
      D3D11_VIEWPORT vp;
      uint32_t cw, ch;
      float sx, sy;
@@ -3272,7 +3356,7 @@ index 4e122b1..5a0b4eb 100644
  
      if (!s_rtv || !pixels)
          return 0;
-@@ -192,6 +521,7 @@ int gpu_present_frame(const uint32_t *pixels)
+@@ -192,6 +524,7 @@ int gpu_present_frame(const uint32_t *pixels)
      }
      ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_frame, 0, NULL,
                                            pixels, s_w * 4, 0);
@@ -3280,7 +3364,7 @@ index 4e122b1..5a0b4eb 100644
      ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
      ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, black);
      /* The largest rectangle of the frame's shape that fits, centred. */
-@@ -212,11 +542,31 @@ int gpu_present_frame(const uint32_t *pixels)
+@@ -212,11 +545,31 @@ int gpu_present_frame(const uint32_t *pixels)
      ID3D11DeviceContext_Draw(s_ctx, 3, 0);
      /* Paced only when Present waited for the vblank: with RECOMP_PRESENT_VSYNC=0
       * the caller keeps its own 16 ms sleep instead of spinning a core. */
@@ -3305,7 +3389,7 @@ index 4e122b1..5a0b4eb 100644
  {
 +    if (s_clock_thread) {
 +        InterlockedExchange(&s_clock_run, 0);
-+        WaitForSingleObject(s_clock_thread, 200);
++        WaitForSingleObject(s_clock_thread, 2000);   /* WaitForVBlank can take a while to return */
 +        CloseHandle(s_clock_thread);
 +        s_clock_thread = NULL;
 +    }
@@ -3313,7 +3397,7 @@ index 4e122b1..5a0b4eb 100644
      if (s_ps)    { ID3D11PixelShader_Release(s_ps);           s_ps = NULL; }
      if (s_vs)    { ID3D11VertexShader_Release(s_vs);          s_vs = NULL; }
      if (s_samp)  { ID3D11SamplerState_Release(s_samp);        s_samp = NULL; }
-@@ -227,9 +577,4 @@ void gpu_present_shutdown(void)
+@@ -227,9 +580,4 @@ void gpu_present_shutdown(void)
      if (s_ctx)   { ID3D11DeviceContext_Release(s_ctx);        s_ctx = NULL; }
      if (s_dev)   { ID3D11Device_Release(s_dev);               s_dev = NULL; }
  }

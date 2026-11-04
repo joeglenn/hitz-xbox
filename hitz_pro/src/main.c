@@ -312,19 +312,28 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 static HANDLE s_log_rd, s_log_out;
 static CRITICAL_SECTION s_log_cs;
 
+/* Copy whatever is waiting in the pipe to the real destination. Called at
+ * exit and from the crash handler: if the pump thread is stuck in a write
+ * (a console nobody reads, a full disk), give up on the lock after two
+ * seconds and write anyway, interleaved rather than lost. */
 static void hitz_log_drain(void)
 {
     char buf[16384];
-    DWORD avail, got, put;
+    DWORD avail, got, put, t0;
+    int locked = 0;
     if (!s_log_rd)
         return;
-    EnterCriticalSection(&s_log_cs);
+    for (t0 = GetTickCount(); ; Sleep(1)) {
+        if (TryEnterCriticalSection(&s_log_cs)) { locked = 1; break; }
+        if (GetTickCount() - t0 > 2000) break;
+    }
     while (PeekNamedPipe(s_log_rd, NULL, 0, NULL, &avail, NULL) && avail) {
         if (!ReadFile(s_log_rd, buf, avail < sizeof buf ? avail : sizeof buf, &got, NULL) || !got)
             break;
         WriteFile(s_log_out, buf, got, &put, NULL);
     }
-    LeaveCriticalSection(&s_log_cs);
+    if (locked)
+        LeaveCriticalSection(&s_log_cs);
 }
 
 static DWORD WINAPI s_log_pump(LPVOID p)
@@ -345,7 +354,7 @@ static DWORD WINAPI s_log_pump(LPVOID p)
 
 static void hitz_log_async(void)
 {
-    HANDLE wr;
+    HANDLE wr, th;
     int fd;
     if (getenv("HITZ_LOG_DIRECT"))
         return;
@@ -359,19 +368,32 @@ static void hitz_log_async(void)
     }
     if (!CreatePipe(&s_log_rd, &wr, NULL, 4u << 20)) {
         CloseHandle(s_log_out);
+        s_log_rd = NULL;
         return;
     }
+    /* The pump runs before fd 2 is redirected: if it cannot start, nothing
+     * would ever empty the pipe and every log line after 4 MB would block. */
+    InitializeCriticalSection(&s_log_cs);
+    th = CreateThread(NULL, 0, s_log_pump, NULL, 0, NULL);
+    if (!th) {
+        DeleteCriticalSection(&s_log_cs);
+        CloseHandle(wr);
+        CloseHandle(s_log_rd);
+        CloseHandle(s_log_out);
+        s_log_rd = NULL;
+        return;
+    }
+    CloseHandle(th);
     fd = _open_osfhandle((intptr_t)wr, _O_WRONLY | _O_BINARY);
     if (fd < 0 || _dup2(fd, 2) != 0) {
-        CloseHandle(s_log_rd);
-        s_log_rd = NULL;
+        /* The pump exits when the write end closes (ReadFile fails). */
         if (fd >= 0) _close(fd); else CloseHandle(wr);
+        CloseHandle(s_log_out);
+        s_log_rd = NULL;                        /* drain() is a no-op from here */
         return;
     }
     _close(fd);                                 /* fd 2 keeps its own copy */
     SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(2));
-    InitializeCriticalSection(&s_log_cs);
-    CloseHandle(CreateThread(NULL, 0, s_log_pump, NULL, 0, NULL));
     atexit(hitz_log_drain);
 }
 
@@ -396,6 +418,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             { "RECOMP_TITLE_KEVENTS", "1" },   /* D3D waits on events it builds (device+0x1DBC) */
             { "RECOMP_PB_WALK", "dma" },       /* faithful GET; the segment scan hangs in 3D */
             { "RECOMP_FLIP_PACING", "1" },     /* flips on the vblank: 60 fps, correct game speed */
+            /* What run_hitz.bat and the launcher set, so the exe started on
+             * its own gets the same game: GPU rendering, a window, sound,
+             * two controller ports. */
+            { "RECOMP_PB_EXEC", "1" },
+            { "RECOMP_VBLANK", "paced" },
+            { "RECOMP_AC97_READY", "1" },
+            { "RECOMP_FB_WINDOW", "1" },
+            { "RECOMP_D3D_PRESENT", "1" },
+            { "RECOMP_USB", "1" },
+            { "RECOMP_USB_PADS", "2" },
+            { "HITZ_GPU", "1" },
         };
         size_t i;
         for (i = 0; i < sizeof defaults / sizeof defaults[0]; i++)
@@ -610,7 +643,8 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
     return TRUE;
 }
 
-/* Console entry point (for debugging -- lets you see printf output) */
+/* Console entry point: only linked when the target is built without WIN32
+ * (/SUBSYSTEM:CONSOLE), to see printf output in a terminal. */
 int main(int argc, char **argv)
 {
     (void)argc;

@@ -67,7 +67,10 @@ def git(*args, check=True, quiet=True):
 
 # ---------------------------------------------------------------- 1. toolkit
 def step_toolkit():
-    base = (PROJ / "toolkit" / "BASE_COMMIT").read_text().strip()
+    try:
+        base = (PROJ / "toolkit" / "BASE_COMMIT").read_text().strip()
+    except OSError:
+        die("hitz_pro/toolkit/BASE_COMMIT is missing; the checkout is incomplete")
     say("Toolkit: xboxrecomp @ %s + patch" % base[:7])
     if shutil.which("git") is None:
         die("git not found. Install it from https://git-scm.com and rerun.")
@@ -220,14 +223,32 @@ def extract_iso(iso, dest):
 
 
 def xbe_title_id(xbe):
-    with open(xbe, "rb") as f:
-        hdr = f.read(0x180)
-        if hdr[:4] != b"XBEH":
-            return None
-        base, = struct.unpack_from("<I", hdr, 0x104)
-        cert, = struct.unpack_from("<I", hdr, 0x118)
-        f.seek(cert - base + 8)
-        return struct.unpack("<I", f.read(4))[0]
+    try:
+        with open(xbe, "rb") as f:
+            hdr = f.read(0x180)
+            if hdr[:4] != b"XBEH":
+                return None
+            base, = struct.unpack_from("<I", hdr, 0x104)
+            cert, = struct.unpack_from("<I", hdr, 0x118)
+            f.seek(cert - base + 8)
+            return struct.unpack("<I", f.read(4))[0]
+    except (OSError, struct.error):
+        return None                     # truncated or unreadable
+
+
+def check_title(xbe):
+    tid = xbe_title_id(xbe)
+    if tid != TITLE_ID:
+        die("%s is not NHL Hitz Pro USA (title id %s, want 0x%08X)"
+            % (xbe, "0x%08X" % tid if tid is not None else "unreadable", TITLE_ID))
+    return tid
+
+
+def replace_game(new_dir):
+    """new_dir (checked) becomes hitz_pro/game; the old one goes only now."""
+    if GAME.exists():
+        shutil.rmtree(GAME)
+    new_dir.rename(GAME)
 
 
 def step_game(iso, game_dir):
@@ -236,32 +257,33 @@ def step_game(iso, game_dir):
     if xbe.exists() and not iso and not game_dir:
         print("  already present")
     elif iso:
+        # Extract next to the old files, check the result, and only then
+        # replace them: a wrong disc or a failed extraction leaves game/ alone.
         iso = Path(iso).expanduser()
         if not iso.is_file():
             die("ISO not found: %s" % iso)
-        if GAME.exists():
-            shutil.rmtree(GAME)
         tmp = PROJ / "game.partial"
         if tmp.exists():
             shutil.rmtree(tmp)
         extract_iso(iso, tmp)
-        tmp.rename(GAME)
+        check_title(tmp / "default.xbe")
+        replace_game(tmp)
     elif game_dir:
         src = Path(game_dir).expanduser()
         if not (src / "default.xbe").is_file():
             die("%s has no default.xbe" % src)
         if src.resolve() != GAME.resolve():
-            if GAME.exists():
-                shutil.rmtree(GAME)
-            shutil.copytree(src, GAME)
+            check_title(src / "default.xbe")
+            tmp = PROJ / "game.partial"
+            if tmp.exists():
+                shutil.rmtree(tmp)
+            shutil.copytree(src, tmp)
+            replace_game(tmp)
             print("  copied")
     else:
         die("No game files yet. Pass the disc image:  --iso \"NHL Hitz Pro (USA).iso\"\n"
             "    or an extracted folder:  --game <folder with default.xbe>")
-    tid = xbe_title_id(xbe)
-    if tid != TITLE_ID:
-        die("hitz_pro/game/default.xbe is not NHL Hitz Pro USA (title id %s, want 0x%08X)"
-            % ("0x%08X" % tid if tid is not None else "unreadable", TITLE_ID))
+    tid = check_title(xbe)
     print("  NHL Hitz Pro (USA), title id 0x%08X" % tid)
 
 

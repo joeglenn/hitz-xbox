@@ -172,7 +172,7 @@ If the link fails with "cannot open file", the game is still running. Close it, 
 
 ### 6. Run
 
-Double-click `hitz_pro\HitzLauncher.exe` (or `run_hitz.bat`). Either starts the exe with `hitz_pro\` as the working directory, which is where it finds `game\default.xbe`. Log output goes to `hitz_pro\hitz_stderr.log`; it reports fps every 10 s.
+Double-click `hitz_pro\HitzLauncher.exe` (or `run_hitz.bat`; the exe itself also runs on its own with the same defaults). Either starts the exe with `hitz_pro\` as the working directory, which is where it finds `game\default.xbe`. Log output goes to `hitz_pro\hitz_stderr.log`; it reports fps every 10 s.
 
 **The launcher** has the settings players need, saved in `hitz_pro\hitz_settings.ini`:
 
@@ -241,8 +241,10 @@ You only need these to change behaviour or to debug. `main.c` and `run_hitz.bat`
 
 | Variable | What it does |
 |---|---|
-| `RECOMP_USB_PADS=1..4` | number of controllers |
+| `RECOMP_USB_PADS=1..4` | number of controller ports (default 2; the launcher's Players setting) |
 | `RECOMP_KEYBOARD=1` | keyboard as pad 1 |
+| `HITZ_GPU_CULL=1` | back-face culling on the GPU (the CPU path never culled; try it if a scene looks wrong) |
+| `HITZ_GPU_READBACK_POLL=1` | old non-waiting frame readback (dropped/repeated frames on some drivers) |
 | `HITZ_PACING=timer` | don't lock the frame clock to the display (the old free-running 60 Hz) |
 | `HITZ_REFRESH_SWITCH=0` | never change the monitor's refresh rate in fullscreen |
 | `HITZ_PERF_LOG=0` | no `hitz_perf.log` |

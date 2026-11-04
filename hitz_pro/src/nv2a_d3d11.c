@@ -17,8 +17,13 @@
  * not cull). Stats every 10 s as [D3D11].
  */
 #define COBJMACROS
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#include <share.h>
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
@@ -988,7 +993,9 @@ static int init_device(void)
             ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(fb), ID3D10Blob_GetBufferSize(fb), NULL, &s_ps_flat);
             ID3D10Blob_Release(fb);
         }
-        if (getenv("HITZ_GPU_FLATPS") && *getenv("HITZ_GPU_FLATPS") == '1' && s_ps_flat) {
+        const char *e;
+        e = getenv("HITZ_GPU_FLATPS");
+        if (e && *e == '1' && s_ps_flat) {
             ID3D11PixelShader_Release(s_ps); s_ps = s_ps_flat; ID3D11PixelShader_AddRef(s_ps);
             fprintf(stderr, "[D3D11] DEBUG: flat pixel shader\n");
         }
@@ -1327,6 +1334,7 @@ static void psc_load(void)
     uint32_t hdr[4], ks, len;
     unsigned long long t0 = now_ns();
     unsigned n = 0, bad = 0;
+    long good_end;                              /* file offset after the last whole record */
     if (fopen_s(&f, PSC_FILE, "rb") != 0 || !f) {
         CreateDirectoryA("cache", NULL);
         goto fresh;
@@ -1337,6 +1345,7 @@ static void psc_load(void)
         fprintf(stderr, "[D3D11] shader cache: built for other shaders; starting afresh\n");
         goto fresh;
     }
+    good_end = ftell(f);
     for (;;) {
         PsKey k;
         void *code;
@@ -1359,11 +1368,22 @@ static void psc_load(void)
             }
         }
         free(code);
+        good_end = ftell(f);
     }
     fclose(f);
+    if (bad && good_end > 0) {
+        /* A record cut short (the game was killed mid-write). Appends go after
+         * it, so without this the shaders compiled from now on would sit
+         * behind garbage and never load again. */
+        int fd;
+        if (_sopen_s(&fd, PSC_FILE, _O_RDWR | _O_BINARY, _SH_DENYRW, 0) == 0 && fd >= 0) {
+            _chsize_s(fd, good_end);
+            _close(fd);
+        }
+    }
     s_spec_loaded = n;
     fprintf(stderr, "[D3D11] shader cache: %u shaders loaded from %s in %.0f ms%s\n", n, PSC_FILE,
-            (now_ns() - t0) / 1e6, bad ? " (file truncated; the rest is rebuilt)" : "");
+            (now_ns() - t0) / 1e6, bad ? " (a damaged tail was cut off; those shaders are rebuilt)" : "");
     xbox_PerfNote("shader cache: %u shaders loaded (states seen in earlier sessions cost nothing)", n);
     return;
 fresh:
@@ -1488,40 +1508,7 @@ static int cring_init(void)
     fprintf(stderr, "[D3D11] constant-buffer ring %u MB\n", s_cring_size >> 20);
     return 1;
 }
-/* Copy `n` bytes into the ring; returns first constant, sets *num. */
-static UINT cb_push(const void *data, UINT n, UINT *num)
-{
-    UINT bytes = (n + 255) & ~255u, at;
-    D3D11_MAPPED_SUBRESOURCE m;
-    if (s_cring_pos + bytes > s_cring_size || !s_cring_map) {
-        if (s_cring_map) ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cring, 0);
-        if (s_cring_pos + bytes > s_cring_size) { s_cring_pos = 0; s_cring_gen++; }
-        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cring, 0,
-                                           s_cring_pos ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-            s_cring_map = NULL;
-            *num = 0;
-            return 0;
-        }
-        s_cring_map = (uint8_t *)m.pData;
-    }
-    at = s_cring_pos;
-    memcpy(s_cring_map + at, data, n);
-    s_cring_pos += bytes;
-    *num = bytes / 16;
-    return at / 16;
-}
-/* The ring must be unmapped before the GPU consumes it: before any draw. */
-static void cb_flush(void)
-{
-    if (s_cring_map) {
-        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cring, 0);
-        s_cring_map = NULL;
-    }
-}
 
-/* Everything a batch needs before its vertices: target, depth, constants,
- * textures, samplers, output-merger and rasteriser state, pixel shader.
- * `prog`: GPU vertex programs (depth clip on). Returns the target or NULL. */
 /* ---------------------------------------------------------------- draw queue
  * Draws are recorded, not issued: constants, vertices, raw attributes and
  * indices are copied into CPU-side windows of the GPU rings, and the state is

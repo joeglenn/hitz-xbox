@@ -38,6 +38,7 @@ The Windows port is complete (2026-11-01). Next phase: the Xbox One X port
 | 9. GPU back end | `hitz_pro/src/nv2a_d3d11.c` | done — 60 fps in matches (NOTES 11-01) |
 | 10. Publish | GitHub + `setup.bat`/`setup.sh` | done — one-command setup, fresh-clone tested |
 | 11. Netplay | separate repo hitz-xbox-netplay | done there; none in this repo |
+| 12. Polish | launcher, perf log, SDL2 pads, pacing | done — HitzLauncher.exe, hitz_perf.log, non-Xbox pads, display-locked frames (NOTES 11-01/11-02) |
 
 ## Directory layout (on odin, `~/hitz-xbox/`)
 

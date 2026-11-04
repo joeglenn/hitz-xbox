@@ -291,10 +291,10 @@ static BOOL ResolvePaths(AppPaths *paths)
         }
     }
 
-    StringCchPrintfW(paths->ini_path, MAX_PATH, L"%s\\hitz_settings.ini", paths->hitz_dir);
-    StringCchPrintfW(paths->game_exe, MAX_PATH, L"%s\\build\\hitz_pro_recomp.exe", paths->hitz_dir);
-    StringCchPrintfW(paths->xbe_path, MAX_PATH, L"%s\\game\\default.xbe", paths->hitz_dir);
-    StringCchPrintfW(paths->log_path, MAX_PATH, L"%s\\hitz_stderr.log", paths->hitz_dir);
+    if (FAILED(StringCchPrintfW(paths->ini_path, MAX_PATH, L"%s\\hitz_settings.ini", paths->hitz_dir))) return FALSE;   /* path too long */
+    if (FAILED(StringCchPrintfW(paths->game_exe, MAX_PATH, L"%s\\build\\hitz_pro_recomp.exe", paths->hitz_dir))) return FALSE;   /* path too long */
+    if (FAILED(StringCchPrintfW(paths->xbe_path, MAX_PATH, L"%s\\game\\default.xbe", paths->hitz_dir))) return FALSE;   /* path too long */
+    if (FAILED(StringCchPrintfW(paths->log_path, MAX_PATH, L"%s\\hitz_stderr.log", paths->hitz_dir))) return FALSE;   /* path too long */
 
     paths->game_found = FileExistsW(paths->game_exe) && FileExistsW(paths->xbe_path);
     return TRUE;
@@ -465,7 +465,7 @@ static BOOL ParseCommandLine(LPCWSTR iniPath)
                 wmemcpy(key, pair, keyLen);
                 key[keyLen] = L'\0';
                 LPCWSTR value = eq + 1;
-                if (IsKnownIniKey(key)) {
+                if (IsKnownIniKey(key) && wcschr(value, L'\r') == NULL && wcschr(value, L'\n') == NULL) {
                     WritePrivateProfileStringW(k_ini_section, key, value, iniPath);
                 }
             }
@@ -684,6 +684,7 @@ typedef struct {
     HWND gpu_combo;
     HWND ctrl_list;
     HFONT font;
+    UINT dpi;                    /* the DPI the controls are laid out for */
 } AppState;
 
 static AppState g_app;
@@ -788,7 +789,12 @@ static void SaveAllControlsIntoSettings(void)
     if (sel <= 0) {
         g_app.settings.gpu_adapter[0] = L'\0';
     } else {
-        SendMessageW(g_app.gpu_combo, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)g_app.settings.gpu_adapter);
+        LRESULT len = SendMessageW(g_app.gpu_combo, CB_GETLBTEXTLEN, (WPARAM)sel, 0);
+        if (len != CB_ERR && len < (LRESULT)ARRAYSIZE(g_app.settings.gpu_adapter)) {
+            SendMessageW(g_app.gpu_combo, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)g_app.settings.gpu_adapter);
+        } else {
+            g_app.settings.gpu_adapter[0] = L'\0';     /* too long to keep: Automatic */
+        }
     }
 }
 
@@ -891,6 +897,40 @@ static void LoadBoolControls(void)
     }
 }
 
+static HFONT CreateUiFont(HWND hwnd, UINT dpi);
+
+typedef struct {
+    HWND parent;
+    UINT from, to;
+} RescaleCtx;
+
+static BOOL CALLBACK RescaleOne(HWND child, LPARAM lParam)
+{
+    const RescaleCtx *c = (const RescaleCtx *)lParam;
+    RECT rc;
+    if (GetParent(child) != c->parent || !GetWindowRect(child, &rc)) {
+        return TRUE;
+    }
+    MapWindowPoints(NULL, c->parent, (POINT *)&rc, 2);
+    MoveWindow(child,
+               MulDiv(rc.left, (int)c->to, (int)c->from),
+               MulDiv(rc.top, (int)c->to, (int)c->from),
+               MulDiv(rc.right - rc.left, (int)c->to, (int)c->from),
+               MulDiv(rc.bottom - rc.top, (int)c->to, (int)c->from), TRUE);
+    return TRUE;
+}
+
+/* Move and resize every control for a new DPI (the window was dragged to a
+ * monitor with another scale factor). */
+static void RescaleChildren(HWND hwnd, UINT fromDpi, UINT toDpi)
+{
+    RescaleCtx c;
+    c.parent = hwnd;
+    c.from = fromDpi;
+    c.to = toDpi;
+    EnumChildWindows(hwnd, RescaleOne, (LPARAM)&c);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -898,6 +938,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
         UINT dpi = DpiForWindow(hwnd);
 
+        g_app.dpi = dpi;
         CreateAllControls(hwnd, inst, dpi);
         PopulateCombos();
         LoadBoolControls();
@@ -939,7 +980,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
         if (id == IDC_OPENLOG && code == BN_CLICKED) {
-            ShellExecuteW(hwnd, L"open", L"explorer.exe", g_app.paths.hitz_dir, NULL, SW_SHOWNORMAL);
+            ShellExecuteW(hwnd, L"explore", g_app.paths.hitz_dir, NULL, NULL, SW_SHOWNORMAL);
             return 0;
         }
         if (id == IDC_QUIT && code == BN_CLICKED) {
@@ -953,6 +994,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SaveSettings(g_app.paths.ini_path, &g_app.settings);
             LaunchGame(hwnd, &g_app.paths, &g_app.settings);
             return 0;
+        }
+        return 0;
+    }
+
+    case WM_DPICHANGED: {
+        UINT newDpi = HIWORD(wParam);
+        const RECT *suggested = (const RECT *)lParam;
+        if (newDpi != 0 && g_app.dpi != 0 && newDpi != g_app.dpi) {
+            RescaleChildren(hwnd, g_app.dpi, newDpi);
+            HFONT old = g_app.font;
+            g_app.font = CreateUiFont(hwnd, newDpi);
+            ApplyFontToChildren(hwnd, g_app.font);
+            if (old != NULL && old != g_app.font && old != (HFONT)GetStockObject(DEFAULT_GUI_FONT)) {
+                DeleteObject(old);
+            }
+            g_app.dpi = newDpi;
+        }
+        if (suggested != NULL) {
+            SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
+                         suggested->right - suggested->left, suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
         }
         return 0;
     }
