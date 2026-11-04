@@ -74,6 +74,10 @@ volatile int g_hitz_heavy;
 static struct { unsigned long long draws, vsh_draws, tris, tex_up, tex_up_bytes, tex_bc, tex_fast, tex_ms_cpu, rt_reads, rt_alias, flips;
                 unsigned long long t_draw_ns, t_flip_ns, t_map_ns, gpu_ns, gpu_frames, rt_skipped, rb_late; } s_st;
 static unsigned long long s_frame_draw_ns;   /* draw building since the last report */
+/* The renderer's timers (draw/flip/texture ms, GPU timestamp queries) only
+ * feed the log and the performance log: off without debug logging. */
+static int s_tm = 1;
+#define TNOW() (s_tm ? now_ns() : 0ull)
 static unsigned long long now_ns(void)
 {
     static LARGE_INTEGER f;
@@ -769,10 +773,10 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
             if (x->key == key && x->w == t->width && x->h == t->height && x->color == t->color
                 && x->pitch == t->pitch && x->cube == t->cube && x->palette == t->palette) {
                 if (x->hashed_frame != s_frame) {
-                    unsigned long long th = now_ns();
+                    unsigned long long th = TNOW();
                     hash = hash_mem(GUEST(t->offset), t->bytes);
                     if (t->palette) hash ^= hash_mem(GUEST(t->palette), 1024) * 31;
-                    xbox_PerfCount(XBOX_PERF_HASH_MS, (now_ns() - th) / 1e6);
+                    xbox_PerfCount(XBOX_PERF_HASH_MS, (TNOW() - th) / 1e6);
                     have_hash = 1;
                     x->hashed_frame = s_frame;
                     if (x->hash != hash) {        /* contents changed: re-upload */
@@ -797,7 +801,7 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
         tex_drop(lru);
         slot = lru;
     }
-    t_up0 = now_ns();
+    t_up0 = TNOW();
     if (!have_hash) {
         hash = hash_mem(GUEST(t->offset), t->bytes);
         if (t->palette) hash ^= hash_mem(GUEST(t->palette), 1024) * 31;
@@ -840,7 +844,7 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
             up_bytes = (size_t)(t->width / 4) * (t->height / 4) * bb * faces;
             s_st.tex_bc++;
         } else {
-            unsigned long long td0 = now_ns();
+            unsigned long long td0 = TNOW();
             size_t need = (size_t)t->width * t->height * faces;
             {   /* which formats still take the CPU path, and how much */
                 static unsigned fmt_n[256], fmt_px[256];
@@ -882,7 +886,7 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
                 sd[f].SysMemSlicePitch = 0;
             }
             up_bytes = need * 4;
-            s_st.tex_ms_cpu += now_ns() - td0;
+            s_st.tex_ms_cpu += TNOW() - td0;
         }
     }
     {
@@ -897,7 +901,7 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
         s_st.tex_up_bytes += up_bytes;
         xbox_PerfCount(XBOX_PERF_TEXTURES, 1);
         xbox_PerfCount(XBOX_PERF_TEX_BYTES, (double)up_bytes);
-        xbox_PerfCount(XBOX_PERF_TEX_MS, (now_ns() - t_up0) / 1e6);
+        xbox_PerfCount(XBOX_PERF_TEX_MS, (TNOW() - t_up0) / 1e6);
         *is_cube = (int)t->cube;
         return x->srv;
     }
@@ -1964,7 +1968,7 @@ static void trace_draw(const char *kind, const Nv2aSurface *s, const Nv2aBatchX 
 static void be_draw_x(const Nv2aSurface *s, const Nv2aBatchX *b)
 {
     if (trace_now()) trace_draw("draw_x", s, b, b->count ? &b->v[0] : NULL);
-    unsigned long long t0 = now_ns();
+    unsigned long long t0 = TNOW();
     UINT bytes = b->count * (UINT)sizeof(Nv2aXVertex), off = ~0u, cbo = ~0u;
     QDraw qd;
     CBData cb;
@@ -1988,7 +1992,7 @@ static void be_draw_x(const Nv2aSurface *s, const Nv2aBatchX *b)
     s_st.draws++;
     s_st.tris += b->count / 3;
     {
-        unsigned long long dt = now_ns() - t0;
+        unsigned long long dt = TNOW() - t0;
         s_st.t_draw_ns += dt;
         s_frame_draw_ns += dt;
     }
@@ -1999,7 +2003,7 @@ static void be_draw_x(const Nv2aSurface *s, const Nv2aBatchX *b)
 static void be_draw_vsh(const Nv2aSurface *s, const Nv2aBatchVsh *b)
 {
     if (trace_now()) trace_draw("draw_vsh", s, &b->x, NULL);
-    unsigned long long t0 = now_ns();
+    unsigned long long t0 = TNOW();
     struct { const uint8_t *p; uint32_t n; int a; } iv[16], tmp;
     uint32_t niv = 0, i, j, total = 0, ib_bytes = b->icount * 4;
     uint32_t base[16];
@@ -2090,7 +2094,7 @@ static void be_draw_vsh(const Nv2aSurface *s, const Nv2aBatchVsh *b)
     s_st.vsh_draws++;
     s_st.tris += b->icount / 3;
     {
-        unsigned long long dt = now_ns() - t0;
+        unsigned long long dt = TNOW() - t0;
         s_st.t_draw_ns += dt;
         s_frame_draw_ns += dt;
     }
@@ -2108,7 +2112,7 @@ static void be_flip(void)
     unsigned long long t0;
     int i;
     if (!s_dev) return;
-    t0 = now_ns();
+    t0 = TNOW();
     if (s_q_ok > 0) qflush();
     /* Unbind so render targets can be copied out cleanly. */
     {
@@ -2151,7 +2155,7 @@ static void be_flip(void)
                     D3D11_MAPPED_SUBRESOURCE m;
                     uint32_t y, x;
                     uint8_t *g;
-                    unsigned long long tm = now_ns();
+                    unsigned long long tm = TNOW();
                     /* Wait for last flip's copy (it was flushed to the GPU
                      * then, so this is normally already done). Polling with
                      * DO_NOT_WAIT used to fail on about half the in-match
@@ -2165,7 +2169,7 @@ static void be_flip(void)
                     if (mh == DXGI_ERROR_WAS_STILL_DRAWING) { s_st.rb_late++; continue; }
                     if (FAILED(mh))
                         continue;
-                    s_st.t_map_ns += now_ns() - tm;
+                    s_st.t_map_ns += TNOW() - tm;
                     g = GUEST(r->va);
                     for (y = 0; y < r->h; y++) {
                         const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
@@ -2191,7 +2195,7 @@ static void be_flip(void)
     }
     /* GPU frame time: [disjoint, t_start] at frame begin, [t_end, end disjoint]
      * at its flip; results collected 3 frames later. */
-    {
+    if (s_tm) {
         static ID3D11Query *dj[4], *t0q[4], *t1q[4];
         static int qinit, qn;
         int k;
@@ -2246,8 +2250,8 @@ static void be_flip(void)
     gprof_flip();
     s_frame++;
     s_st.flips++;
-    s_st.t_flip_ns += now_ns() - t0;
-    xbox_PerfCount(XBOX_PERF_FLUSH_MS, (now_ns() - t0) / 1e6);
+    s_st.t_flip_ns += TNOW() - t0;
+    xbox_PerfCount(XBOX_PERF_FLUSH_MS, (TNOW() - t0) / 1e6);
     xbox_PerfCount(XBOX_PERF_DRAW_MS, s_frame_draw_ns / 1e6);
     s_frame_draw_ns = 0;
     {
@@ -2285,6 +2289,7 @@ void hitz_gpu_backend_init(void)
     const char *e = getenv("HITZ_GPU");
     if (!e || *e != '1')
         return;
+    s_tm = g_hitz_log || xbox_PerfEnabled();
     {
         const char *v = getenv("HITZ_GPU_VSH");      /* 0: vertex programs on the CPU */
         int gpu_vsh = !(v && *v == '0');

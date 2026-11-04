@@ -34,6 +34,9 @@
 #include <io.h>
 #include <fcntl.h>
 static void hitz_log_drain(void);   /* the log pipe, below */
+
+/* Debug logging: g_hitz_log (hitz_log_gate.h); 0 = every log print is
+ * skipped. Set from HITZ_DEBUG at the top of WinMain, before any print. */
 #include <dbghelp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -223,6 +226,17 @@ typedef struct MCPXAPUState MCPXAPUState;
 extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 extern MCPXAPUState *g_apu_state;
 
+/* A crash with debug logging off still leaves a report: hitz_crash.log. */
+static void hitz_crash_log(void)
+{
+    FILE *f;
+    if (g_hitz_log)
+        return;
+    if (freopen_s(&f, "hitz_crash.log", "w", stderr) == 0)
+        setvbuf(stderr, NULL, _IONBF, 0);
+    g_hitz_log = 1;
+}
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -249,6 +263,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         if (xbox_VehMmioFault(ep))
             return EXCEPTION_CONTINUE_EXECUTION;
 
+        hitz_crash_log();
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
             (unsigned long long)ep->ContextRecord->Rip,
             (unsigned long long)fault_addr,
@@ -410,7 +425,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
-    hitz_log_async();
+    {
+        /* Debug logging: the launcher's "Debug logging" box (HITZ_DEBUG=1).
+         * Off, no log line is formatted or written, the log pipe and its
+         * thread are not started, there is no performance log and the
+         * renderer's timers stay off; a crash still writes hitz_crash.log. */
+        const char *d = getenv("HITZ_DEBUG");
+        g_hitz_log = d && *d == '1';
+        if (g_hitz_log)
+            hitz_log_async();
+    }
 
     /* Title defaults (an explicit environment setting wins). */
     {
@@ -443,14 +467,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             /* launcher name          toolkit name             default */
             { "HITZ_PACING",         "RECOMP_PACING",         "auto" },  /* lock frames to the display */
             { "HITZ_REFRESH_SWITCH", "RECOMP_REFRESH_SWITCH", "1" },     /* fullscreen: 60 Hz multiple */
-            { "HITZ_PERF_LOG",       "RECOMP_PERF_LOG",       "1" },     /* hitz_perf.log, F9 marks */
+            { "HITZ_PERF_LOG",       "RECOMP_PERF_LOG",       NULL },    /* hitz_perf.log: with debug logging */
             { "HITZ_SDL_PADS",       "RECOMP_SDL_PADS",       "1" },     /* non-Xbox controllers */
         };
         size_t i;
         for (i = 0; i < sizeof map / sizeof map[0]; i++)
             if (!getenv(map[i][1])) {
                 const char *v = getenv(map[i][0]);
-                _putenv_s(map[i][1], v && *v ? v : map[i][2]);
+                _putenv_s(map[i][1], v && *v ? v : map[i][2] ? map[i][2] : g_hitz_log ? "1" : "0");
             }
         if (!getenv("RECOMP_PERF_LOG_FILE"))
             _putenv_s("RECOMP_PERF_LOG_FILE", "hitz_perf.log");

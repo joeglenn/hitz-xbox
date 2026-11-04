@@ -172,13 +172,13 @@ If the link fails with "cannot open file", the game is still running. Close it, 
 
 ### 6. Run
 
-Double-click `hitz_pro\HitzLauncher.exe` (or `run_hitz.bat`; the exe itself also runs on its own with the same defaults). Either starts the exe with `hitz_pro\` as the working directory, which is where it finds `game\default.xbe`. Log output goes to `hitz_pro\hitz_stderr.log`; it reports fps every 10 s.
+Double-click `hitz_pro\HitzLauncher.exe` (or `run_hitz.bat`; the exe itself also runs on its own with the same defaults). Either starts the exe with `hitz_pro\` as the working directory, which is where it finds `game\default.xbe`. With **Debug logging** ticked in the launcher (or `HITZ_DEBUG=1`), log output goes to `hitz_pro\hitz_stderr.log` (fps every 10 s) and `hitz_pro\hitz_perf.log`. It is off by default: then nothing is logged at all, and a crash still leaves `hitz_pro\hitz_crash.log`.
 
 **The launcher** has the settings players need, saved in `hitz_pro\hitz_settings.ini`:
 
 - **Display:** windowed or fullscreen, window size, smooth or sharp picture, frame pacing, the fullscreen refresh switch, and which GPU to use.
 - **Controls:** number of players, keyboard as player 1, non-Xbox controllers on/off, and a list of the controllers it can see.
-- **Diagnostics:** the performance log on/off, and a button that opens the folder with the logs.
+- **Diagnostics:** Debug logging on/off (`hitz_stderr.log` and `hitz_perf.log`; off by default, and off means no logging code runs while you play), and a button that opens the folder with the logs. Tick it before playing a session you want to send logs from.
 
 ### Smooth motion
 
@@ -202,7 +202,7 @@ The game runs at 60 frames a second. To show every frame for the same length of 
 
 **Other controllers** (8BitDo in Switch or D-input mode, PlayStation, Switch Pro, most USB/Bluetooth pads) work through SDL2, which setup downloads (`build\SDL2.dll`). Buttons go by position: the bottom face button is A, as on an Xbox pad.
 
-Players are numbered in the order controllers connect, whatever kind they are, and they can be plugged in or out at any time. `hitz_stderr.log` and `hitz_perf.log` name each controller and its player (`[PAD] player 1: ...`).
+Players are numbered in the order controllers connect, whatever kind they are, and they can be plugged in or out at any time. With Debug logging on, `hitz_stderr.log` and `hitz_perf.log` name each controller and its player (`[PAD] player 1: ...`).
 
 For two players on one machine, plug in two controllers. `run_hitz.bat` sets `RECOMP_USB_PADS=2`. On the team-select screen each player pushes the stick toward **Away** or **Home**, then presses **A**.
 
@@ -250,7 +250,8 @@ You only need these to change behaviour or to debug. `main.c` and `run_hitz.bat`
 | `HITZ_GPU_READBACK_POLL=1` | old non-waiting frame readback (dropped/repeated frames on some drivers) |
 | `HITZ_PACING=timer` | don't lock the frame clock to the display (the old free-running 60 Hz) |
 | `HITZ_REFRESH_SWITCH=0` | never change the monitor's refresh rate in fullscreen |
-| `HITZ_PERF_LOG=0` | no `hitz_perf.log` |
+| `HITZ_DEBUG=1` | debug logging: `hitz_stderr.log` (from the launcher or `run_hitz.bat`) and `hitz_perf.log`. Default 0: no log output at all |
+| `HITZ_PERF_LOG=0/1` | `hitz_perf.log` regardless of `HITZ_DEBUG` |
 | `HITZ_SDL_PADS=0` | only Xbox (XInput) controllers |
 | `HITZ_GPU_ASYNC_SHADERS=0` | compile new shaders on the render thread (stalls a frame each, as before) |
 | `HITZ_SHADER_CACHE=0` | don't keep compiled shaders in `hitz_pro\cache\` |

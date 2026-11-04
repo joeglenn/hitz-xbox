@@ -384,3 +384,11 @@ Player's perf log (RTX 4090 laptop, 280 s fullscreen): 12 in-match hitches of 26
 - DXT1/3/5 (most of the game's textures) now go to the GPU as BC1/2/3 unchanged: no CPU decode, 1/4-1/8 the upload. Top level must be whole 4x4 blocks, else the old path.
 - The uncompressed formats still seen (swizzled A1R5G5B5/A8R8G8B8 in matches, linear YUY2 movie frames, LIN_A8R8G8B8) get a row-at-a-time decoder: separable Morton tables for the swizzle, the same channel expansion and BT.601 maths as the toolkit. `HITZ_TEX_VERIFY=1` compared it with the toolkit's decoder: identical for every format seen (0 texels differ).
 - VM attract demo, 220 s: hitches 18 -> 12; in-match `tex` 45.5/8.0/12.2/8.7 ms -> 0.9/0.1/6.0/3.9 ms; movie frames 1.7 -> 0.7 ms each. Screenshots: ice markings, board ads, crowd, players, logos and the DEMO overlay's transparency all correct. What remains in those frames is the game's own loading code (`rest`).
+
+## 2026-11-04: Debug logging toggle
+
+The launcher's Diagnostics box is now **Debug logging** (`debug` in hitz_settings.ini, `HITZ_DEBUG`), off by default, replacing the performance-log box.
+- Off: `src/hitz_log_gate.h`, force-included (`/FI`, set from CMakeLists.txt) into the toolkit libraries and our own sources but not the generated code, turns every print to stderr/stdout (`fprintf`, `vfprintf`, `fputs`, `fputc`, `fwrite`, `printf`, `vprintf`, `puts`) into one test of `g_hitz_log` before any formatting. The log pipe and its pump thread are not started, there is no `hitz_perf.log` (the kernel-call timing behind it is already gated on it), and the renderer's timers and GPU timestamp queries are off. The launcher hands the game NUL instead of truncating `hitz_stderr.log`; `run_hitz.bat` starts the exe without a redirect. A crash still writes `hitz_crash.log` (the fault handler reopens stderr there).
+- On: exactly the old logs. `HITZ_PERF_LOG=0/1` still overrides the perf log on its own.
+- No toolkit patch change, so updating needs no regeneration, only a rebuild of the toolkit libraries and our files.
+- VM: `run_hitz.bat` off: no log files, 60 fps; on: both logs as before. Launcher off: INI `debug=0`, no logs, game running; on (`--set debug=1`): 53 KB stderr log + perf log with `HITZ_DEBUG=1` in its header. Caption fits the window.

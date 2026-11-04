@@ -137,7 +137,7 @@ static void ShowWin32Error(HWND owner, LPCWSTR context)
 #define IDC_PLAYERS     1007
 #define IDC_KEYBOARD    1008
 #define IDC_SDLPADS     1009
-#define IDC_PERFLOG     1010
+#define IDC_DEBUG       1010
 #define IDC_CTRLLIST    1011
 #define IDC_CTRLREFRESH 1012
 #define IDC_OPENLOG     1013
@@ -191,8 +191,8 @@ static const SettingDef g_settings[] = {
       0, L"Keyboard controls player 1", IDC_KEYBOARD },
     { L"sdl_pads",       L"HITZ_SDL_PADS", L"1",            NULL, NULL, NULL,
       0, L"Non-Xbox controllers (8BitDo, PlayStation, Switch)", IDC_SDLPADS },
-    { L"perf_log",       L"HITZ_PERF_LOG", L"1",            NULL, NULL, NULL,
-      0, L"Write a performance log (hitz_perf.log)", IDC_PERFLOG },
+    { L"debug",          L"HITZ_DEBUG", L"0",               NULL, NULL, NULL,
+      0, L"Debug logging (hitz_stderr.log, hitz_perf.log)", IDC_DEBUG },
 };
 
 #define SETTING_COUNT (int)(sizeof(g_settings) / sizeof(g_settings[0]))
@@ -588,8 +588,19 @@ static void RefreshControllerList(HWND listBox, LPCWSTR hitzDir)
 /* Launching the game                                                   */
 /* ------------------------------------------------------------------ */
 
+/* The "Debug logging" box. */
+static BOOL DebugLogging(const AppSettings *settings)
+{
+    int i;
+    for (i = 0; i < SETTING_COUNT; i++)
+        if (lstrcmpW(g_settings[i].ini_key, L"debug") == 0)
+            return lstrcmpW(settings->values[i], L"1") == 0;
+    return FALSE;
+}
+
 static void LaunchGame(HWND mainWnd, const AppPaths *paths, const AppSettings *settings)
 {
+    const BOOL debug = DebugLogging(settings);
     ApplyEnvironment(settings);
 
     SECURITY_ATTRIBUTES sa;
@@ -597,8 +608,13 @@ static void LaunchGame(HWND mainWnd, const AppPaths *paths, const AppSettings *s
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
 
-    HANDLE logHandle = CreateFileW(paths->log_path, GENERIC_WRITE, FILE_SHARE_READ, &sa,
-                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    /* Debug logging off: the game writes no log, so it gets NUL and the last
+     * hitz_stderr.log is left as it was. */
+    HANDLE logHandle = debug
+        ? CreateFileW(paths->log_path, GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
+        : CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (logHandle == INVALID_HANDLE_VALUE) {
         ShowWin32Error(mainWnd, L"Could not create the log file.");
         return;
@@ -666,9 +682,15 @@ wait_done:
 
     if (exitCode != 0) {
         wchar_t msg[640];
-        StringCchPrintfW(msg, ARRAYSIZE(msg),
-                          L"NHL Hitz Pro exited with code %lu.\n\nSee the log for details:\n%s",
-                          exitCode, paths->log_path);
+        if (debug)
+            StringCchPrintfW(msg, ARRAYSIZE(msg),
+                              L"NHL Hitz Pro exited with code %lu.\n\nSee the log for details:\n%s",
+                              exitCode, paths->log_path);
+        else
+            StringCchPrintfW(msg, ARRAYSIZE(msg),
+                              L"NHL Hitz Pro exited with code %lu.\n\nA crash leaves hitz_crash.log in the "
+                              L"log folder. For a full log, tick \"Debug logging\" and play again.",
+                              exitCode);
         MessageBoxW(mainWnd, msg, L"NHL Hitz Pro", MB_OK | MB_ICONWARNING);
     }
 }

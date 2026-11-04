@@ -85,6 +85,28 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 # one file: a target-wide include path would rebuild every generated file.
 set_source_files_properties(src/nv2a_d3d11.c PROPERTIES INCLUDE_DIRECTORIES "${XBOXRECOMP_DIR}/src")
 
+# Debug logging switch (src/hitz_log_gate.h): every print to stderr/stdout in
+# the toolkit and in our own files is skipped unless HITZ_DEBUG=1. Per file
+# for our sources, never target-wide: that would rebuild the generated code.
+if(MSVC)
+    set(HITZ_LOG_GATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/src/hitz_log_gate.h")
+else()
+    set(HITZ_LOG_GATE -include "${CMAKE_CURRENT_SOURCE_DIR}/src/hitz_log_gate.h")
+endif()
+foreach(tk xbox_kernel xbox_d3d8 xbox_apu xbox_input xbox_input_map xbox_usb xbox_dsound
+           xbox_nv2a xbox_video recomp_exit_hook host_time)
+    if(TARGET ${tk})
+        target_compile_options(${tk} PRIVATE ${HITZ_LOG_GATE})
+    endif()
+endforeach()
+if(TARGET platform)
+    get_target_property(_plat_type platform TYPE)
+    if(NOT _plat_type STREQUAL "INTERFACE_LIBRARY")
+        target_compile_options(platform PRIVATE ${HITZ_LOG_GATE})
+    endif()
+endif()
+set_property(SOURCE ${GAME_SOURCES} APPEND PROPERTY COMPILE_OPTIONS ${HITZ_LOG_GATE})
+
 # Windows SDK libraries needed at link time
 target_link_libraries(${PROJECT_NAME} PRIVATE
     d3d11
