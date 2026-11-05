@@ -35,6 +35,8 @@ NOTES.md                   dated engineering log: every bug and fix
 CLAUDE.md                  phase plan / project overview
 ```
 
+Optional: put a cover picture (for example a scan of your game's box) at `hitz_pro\cover.jpg` (or `.png`) and the launcher shows it on the left. It is your file; it is not part of this repo.
+
 ---
 
 ## Requirements

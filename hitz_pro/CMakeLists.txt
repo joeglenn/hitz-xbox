@@ -154,7 +154,7 @@ if(WIN32)
     add_executable(hitz_launcher WIN32 src/launcher/hitz_launcher.c)
     target_compile_definitions(hitz_launcher PRIVATE UNICODE _UNICODE)
     target_link_libraries(hitz_launcher PRIVATE user32 gdi32 comctl32 shell32 dxgi
-                          $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput> ole32)
+                          $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput> ole32 windowscodecs)
     if(MSVC)
         target_compile_options(hitz_launcher PRIVATE /W4 /utf-8)
     endif()

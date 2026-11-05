@@ -7,7 +7,7 @@
  * Build (MSVC, from a Developer Command Prompt / after vcvars64.bat):
  *   cl /nologo /W4 /WX /O2 /utf-8 /DUNICODE /D_UNICODE hitz_launcher.c /link
  *      /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib shell32.lib
- *      dxgi.lib xinput.lib ole32.lib
+ *      dxgi.lib xinput.lib ole32.lib windowscodecs.lib
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -26,6 +26,8 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#define COBJMACROS
+#include <wincodec.h>
 #include <shellapi.h>
 #include <strsafe.h>
 #include <xinput.h>
@@ -953,6 +955,113 @@ static void RescaleChildren(HWND hwnd, UINT fromDpi, UINT toDpi)
     EnumChildWindows(hwnd, RescaleOne, (LPARAM)&c);
 }
 
+/* ---- Cover panel ----
+ * hitz_pro\\cover.jpg (or .png), if the player put one there, is drawn on the
+ * left at the window's height; the controls move right to make room. The
+ * image is decoded once with WIC and scaled (Fant) whenever the size changes. */
+static IWICImagingFactory *s_wic;
+static IWICBitmapSource   *s_cover;         /* 32bpp premultiplied BGRA */
+static UINT                s_cover_w, s_cover_h;
+static HBITMAP             s_cover_bmp;
+static int                 s_cover_bw, s_cover_bh;
+
+static int CoverLoad(const wchar_t *dir)
+{
+    static const wchar_t *names[] = { L"cover.jpg", L"cover.jpeg", L"cover.png" };
+    wchar_t path[MAX_PATH];
+    int i;
+    if (FAILED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)) && !s_wic) {
+        /* already initialised another way: carry on */
+    }
+    if (!s_wic && FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                                          &IID_IWICImagingFactory, (void **)&s_wic))) {
+        s_wic = NULL;
+        return 0;
+    }
+    for (i = 0; i < (int)ARRAYSIZE(names) && !s_cover; i++) {
+        IWICBitmapDecoder *dec = NULL;
+        IWICBitmapFrameDecode *frame = NULL;
+        if (FAILED(StringCchPrintfW(path, MAX_PATH, L"%s\\%s", dir, names[i]))) continue;
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) continue;
+        if (SUCCEEDED(IWICImagingFactory_CreateDecoderFromFilename(s_wic, path, NULL, GENERIC_READ,
+                                                                    WICDecodeMetadataCacheOnDemand, &dec))
+            && SUCCEEDED(IWICBitmapDecoder_GetFrame(dec, 0, &frame))
+            && SUCCEEDED(WICConvertBitmapSource(&GUID_WICPixelFormat32bppPBGRA, (IWICBitmapSource *)frame, &s_cover))
+            && (FAILED(IWICBitmapSource_GetSize(s_cover, &s_cover_w, &s_cover_h)) || !s_cover_w || !s_cover_h)) {
+            IWICBitmapSource_Release(s_cover);
+            s_cover = NULL;
+        }
+        if (frame) IWICBitmapFrameDecode_Release(frame);
+        if (dec) IWICBitmapDecoder_Release(dec);
+    }
+    return s_cover != NULL;
+}
+
+static int CoverWidth(int clientH)
+{
+    return s_cover ? MulDiv(clientH, (int)s_cover_w, (int)s_cover_h) : 0;
+}
+
+static HBITMAP CoverBitmap(int w, int h)
+{
+    IWICBitmapScaler *sc = NULL;
+    BITMAPINFO bi;
+    void *bits = NULL;
+    HBITMAP bmp;
+    if (s_cover_bmp && s_cover_bw == w && s_cover_bh == h) return s_cover_bmp;
+    if (s_cover_bmp) { DeleteObject(s_cover_bmp); s_cover_bmp = NULL; }
+    if (!s_cover || w <= 0 || h <= 0 || FAILED(IWICImagingFactory_CreateBitmapScaler(s_wic, &sc))) return NULL;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;                  /* top-down */
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    bmp = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (bmp && bits
+        && SUCCEEDED(IWICBitmapScaler_Initialize(sc, s_cover, (UINT)w, (UINT)h, WICBitmapInterpolationModeFant))
+        && SUCCEEDED(IWICBitmapScaler_CopyPixels(sc, NULL, (UINT)w * 4, (UINT)w * 4 * (UINT)h, (BYTE *)bits))) {
+        s_cover_bmp = bmp;
+        s_cover_bw = w;
+        s_cover_bh = h;
+    } else if (bmp) {
+        DeleteObject(bmp);
+    }
+    IWICBitmapScaler_Release(sc);
+    return s_cover_bmp;
+}
+
+static BOOL CALLBACK ShiftOne(HWND child, LPARAM lParam)
+{
+    HWND parent = GetParent(child);
+    RECT rc;
+    if (!parent || !GetWindowRect(child, &rc)) return TRUE;
+    if (parent != GetAncestor(child, GA_PARENT)) return TRUE;
+    MapWindowPoints(NULL, parent, (POINT *)&rc, 2);
+    SetWindowPos(child, NULL, rc.left + (int)lParam, rc.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    return TRUE;
+}
+
+/* After the controls exist: with a cover, make the window wider and move
+ * every control right by the panel's width. */
+static void CoverLayout(HWND hwnd)
+{
+    RECT rc, wr;
+    int pw;
+    HWND child;
+    if (!CoverLoad(g_app.paths.hitz_dir)) return;
+    GetClientRect(hwnd, &rc);
+    pw = CoverWidth(rc.bottom);
+    for (child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
+        ShiftOne(child, pw);
+    wr.left = 0; wr.top = 0; wr.right = rc.right + pw; wr.bottom = rc.bottom;
+    AdjustWindowRectEx(&wr, (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE), FALSE,
+                       (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+    SetWindowPos(hwnd, NULL, 0, 0, wr.right - wr.left, wr.bottom - wr.top,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -980,6 +1089,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         RefreshControllerList(g_app.ctrl_list, g_app.paths.hitz_dir);
         UpdateScaleEnabled(hwnd);
         ApplyFontToChildren(hwnd, g_app.font);
+        CoverLayout(hwnd);
 
         if (!g_app.paths.game_found) {
             EnableWindow(GetDlgItem(hwnd, IDC_PLAY), FALSE);
@@ -1041,7 +1151,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
+    case WM_PAINT:
+        if (s_cover) {
+            PAINTSTRUCT ps;
+            RECT rc;
+            HDC dc = BeginPaint(hwnd, &ps);
+            int pw;
+            HBITMAP bmp;
+            GetClientRect(hwnd, &rc);
+            pw = CoverWidth(rc.bottom);
+            bmp = CoverBitmap(pw, rc.bottom);
+            if (bmp) {
+                HDC mem = CreateCompatibleDC(dc);
+                HGDIOBJ old = SelectObject(mem, bmp);
+                BitBlt(dc, 0, 0, pw, rc.bottom, mem, 0, 0, SRCCOPY);
+                SelectObject(mem, old);
+                DeleteDC(mem);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        break;
+
     case WM_DESTROY:
+        if (s_cover_bmp) { DeleteObject(s_cover_bmp); s_cover_bmp = NULL; }
+        if (s_cover) { IWICBitmapSource_Release(s_cover); s_cover = NULL; }
+        if (s_wic) { IWICImagingFactory_Release(s_wic); s_wic = NULL; }
         PostQuitMessage(0);
         return 0;
 
