@@ -323,7 +323,22 @@ agent wrote the code, ran the builds and automated tests, and read the logs.
 Nothing generated from the game (code, textures, movies) is in these repos;
 everyone rebuilds it from their own copy.
 
+### Libraries, tools and models
+
+- [Claude Opus](https://www.anthropic.com/claude) by Anthropic, the AI model, in the [Hermes agent](https://github.com/NousResearch/hermes-agent) by Nous Research
+- [xboxrecomp](https://github.com/sp00nznet/xboxrecomp), the static recompiler and Xbox runtime (MIT)
+- [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/downloads/) (MSVC), [CMake](https://cmake.org), [Ninja](https://ninja-build.org), [Python](https://www.python.org), [uv](https://github.com/astral-sh/uv), [Git](https://git-scm.com)
+- [Direct3D 11](https://learn.microsoft.com/windows/win32/direct3d11/atoc-dx-graphics-direct3d-11), [XAudio2](https://learn.microsoft.com/windows/win32/xaudio2/xaudio2-introduction), [XInput](https://learn.microsoft.com/windows/win32/xinput/getting-started-with-xinput) (Windows)
+- [SDL2](https://www.libsdl.org) for non-Xbox controllers (zlib licence), downloaded by setup
+
 ## Credits
 
 - [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) by sp00nznet and contributors. The patch here is a derivative of it; see its licence.
 - NHL Hitz Pro © Midway / NHL / NHLPA. This repo contains no game code or assets.
+
+## License
+
+The code in this repo is under the [MIT License](LICENSE). The toolkit patch
+(`xboxrecomp-hitz.patch`, `hitz_pro/toolkit/`) changes xboxrecomp and keeps its
+MIT licence and copyright. NHL Hitz Pro itself is not covered: you need your
+own copy of the game, and nothing from it is in this repo.
