@@ -188,7 +188,7 @@ The game runs at 60 frames a second. To show every frame for the same length of 
 
 - On a 60 Hz monitor (or 120/240 Hz), the game's frame clock locks to the monitor's refresh, so frames are never doubled or skipped.
 - On a 144/165 Hz monitor, 60 doesn't divide evenly into the refresh rate. With G-Sync/FreeSync, fullscreen is smooth anyway. Without it, the launcher's **refresh switch** (on by default) switches the monitor to 120 or 60 Hz while the game is fullscreen and back when you leave.
-- F11 or Alt+Enter toggles fullscreen.
+- F11 or Alt+Enter toggles fullscreen; Esc leaves it.
 
 ### Performance log and F9
 
