@@ -299,6 +299,30 @@ The scripts in `tools/` come from the original dev setup: a Windows VM on Linux 
 | `hostprof_resolve.py`, `hp_diff.py`, `rva2sym.py` | profiling and crash symbolisation (portable) |
 | `gpu-vfio-boot.sh`, `win11-gpu.sh`, `mk_vfct.py` | AMD iGPU passthrough to a dockurr/windows VM |
 
+## How this was made
+
+This port was built by Joe Glenn together with an AI coding agent:
+**Claude Opus** (Anthropic), running in the **Hermes** agent (Nous Research),
+which drove a Linux workstation and a Windows VM through a terminal. Joe set
+the goals, played every build and reported what looked or felt wrong; the
+agent wrote the code, ran the builds and automated tests, and read the logs.
+
+- **Recompiler:** [xboxrecomp](https://github.com/sp00nznet/xboxrecomp)
+  translates the game's x86 code to C ahead of time; its runtime emulates the
+  Xbox kernel, NV2A GPU, audio and USB. This repo adds the game-specific
+  patches and a Direct3D 11 renderer for the NV2A.
+- **Build:** MSVC (Visual Studio 2022 Build Tools), CMake and Ninja on
+  Windows 11; Python (run with uv) for setup and code generation.
+- **Development rig:** an AMD Strix Halo PC (Radeon 8060S) running Ubuntu,
+  with a Windows 11 VM getting the GPU by passthrough, so the game could be
+  built, run, screenshotted and timed automatically.
+- **Testing:** scripted runs in the VM (boot, menus, a full exhibition match
+  driven by recorded pad input), frame-time logs (`hitz_perf.log`, F9 marks),
+  screenshots checked frame by frame, and unit tests for the tools.
+
+Nothing generated from the game (code, textures, movies) is in these repos;
+everyone rebuilds it from their own copy.
+
 ## Credits
 
 - [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) by sp00nznet and contributors. The patch here is a derivative of it; see its licence.

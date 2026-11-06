@@ -397,3 +397,7 @@ The launcher's Diagnostics box is now **Debug logging** (`debug` in hitz_setting
 
 - The clips (player close-ups, face-off intros, fight punches, pre-replay clips) use a depth of field: the frame is box-blurred into a 320x240 target and blended back over the frame by depth, which the game reads by sampling its own Z buffer (0x8065C000) as a LIN_A8B8G8R8 texture (format 0x3F). Our depth lives only on the GPU, so the game read stale guest memory and the blur covered the players as well as the crowd.
 - Depth buffers are now R32G8X24_TYPELESS with depth and stencil views; a texture at the address of a depth buffer drawn with in the last 2 frames is made on the GPU (`z_as_texture`: flush, one full-screen pass) laid out as the Xbox stores D24S8 -- R = stencil, G/B/A = depth*0xFFFFFF low/mid/high byte. Players sharp, crowd blurred, as on the console.
+
+## 2026-11-07: README "How this was made"
+
+- Section on the tools, the development setup and the AI involved (Claude Opus in the Hermes agent; Real-ESRGAN for the HD edition's assets).
