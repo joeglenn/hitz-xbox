@@ -52,6 +52,7 @@ file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
+    src/cheats.c
     src/hostprof_win.c
     src/nv2a_d3d11.c
     src/recomp_kick.c
@@ -151,7 +152,7 @@ endif()
 # diagnostics options for players, saved in hitz_settings.ini, then starts
 # the game with them. setup.py copies it to hitz_pro/HitzLauncher.exe.
 if(WIN32)
-    add_executable(hitz_launcher WIN32 src/launcher/hitz_launcher.c)
+    add_executable(hitz_launcher WIN32 src/launcher/hitz_launcher.c src/launcher/launcher_cheats.c)
     target_compile_definitions(hitz_launcher PRIVATE UNICODE _UNICODE)
     target_link_libraries(hitz_launcher PRIVATE user32 gdi32 comctl32 shell32 dxgi
                           $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput> ole32 windowscodecs)

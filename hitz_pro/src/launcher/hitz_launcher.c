@@ -30,6 +30,8 @@
 #include <wincodec.h>
 #include <shellapi.h>
 #include <strsafe.h>
+
+#include "launcher_cheats.h"
 #include <xinput.h>
 #include <stdio.h>
 #include <wchar.h>
@@ -145,6 +147,7 @@ static void ShowWin32Error(HWND owner, LPCWSTR context)
 #define IDC_OPENLOG     1013
 #define IDC_PLAY        1014
 #define IDC_QUIT        1015
+#define IDC_CHEATS      1050
 
 typedef struct {
     LPCWSTR ini_key;            /* key name inside hitz_settings.ini    */
@@ -238,7 +241,7 @@ typedef struct {
     BOOL unset; /* TRUE => unset the variable rather than set it */
 } EnvEntry;
 
-#define MAX_ENV_ENTRIES (SETTING_COUNT + 1 + STATIC_ENV_COUNT)
+#define MAX_ENV_ENTRIES (SETTING_COUNT + 1 + STATIC_ENV_COUNT + CHEATS_ENV_COUNT)
 
 /* ------------------------------------------------------------------ */
 /* Application paths                                                   */
@@ -318,6 +321,7 @@ static void LoadSettings(LPCWSTR iniPath, AppSettings *out)
     }
     GetPrivateProfileStringW(k_ini_section, k_gpu_ini_key, L"",
                               out->gpu_adapter, GPU_VALUE_CAP, iniPath);
+    Cheats_Load(iniPath);
 }
 
 static void SaveSettings(LPCWSTR iniPath, const AppSettings *in)
@@ -327,6 +331,7 @@ static void SaveSettings(LPCWSTR iniPath, const AppSettings *in)
         WritePrivateProfileStringW(k_ini_section, d->ini_key, in->values[i], iniPath);
     }
     WritePrivateProfileStringW(k_ini_section, k_gpu_ini_key, in->gpu_adapter, iniPath);
+    Cheats_Save(iniPath);
 }
 
 /* Map a stored ini value to the environment-variable value for a given
@@ -378,6 +383,13 @@ static int BuildEnvList(const AppSettings *s, EnvEntry entries[MAX_ENV_ENTRIES])
         entries[n].unset = FALSE;
     }
     n++;
+
+    for (int i = 0; i < CHEATS_ENV_COUNT; i++) {
+        LPCWSTR name;
+        entries[n].unset = !Cheats_Env(i, &name, entries[n].value, ARRAYSIZE(entries[n].value));
+        StringCchCopyW(entries[n].name, ARRAYSIZE(entries[n].name), name);
+        n++;
+    }
 
     for (int i = 0; i < STATIC_ENV_COUNT; i++) {
         wchar_t probe[4];
@@ -432,6 +444,9 @@ static void PrintEnvToStdout(const AppSettings *s)
 
 static BOOL IsKnownIniKey(LPCWSTR key)
 {
+    if (Cheats_IsKnownIniKey(key)) {
+        return TRUE;
+    }
     for (int i = 0; i < SETTING_COUNT; i++) {
         if (_wcsicmp(key, g_settings[i].ini_key) == 0) {
             return TRUE;
@@ -706,6 +721,7 @@ typedef struct {
     AppPaths paths;
     AppSettings settings;
     HWND combo_or_check[SETTING_COUNT];
+    HWND cheats_button;
     HWND gpu_combo;
     HWND ctrl_list;
     HFONT font;
@@ -1078,6 +1094,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         g_app.dpi = dpi;
         CreateAllControls(hwnd, inst, dpi);
+        g_app.cheats_button = Cheats_CreateButton(hwnd, inst, IDC_CHEATS, dpi);
         PopulateCombos();
         LoadBoolControls();
         EnumerateGpuAdapters(g_app.gpu_combo);
@@ -1112,6 +1129,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (id == IDC_MODE && code == CBN_SELCHANGE) {
             UpdateScaleEnabled(hwnd);
+            return 0;
+        }
+        if (id == IDC_CHEATS && code == BN_CLICKED) {
+            if (Cheats_ShowDialog(hwnd, g_app.font, g_app.dpi ? g_app.dpi : 96)) {
+                Cheats_Save(g_app.paths.ini_path);
+                Cheats_UpdateButton(g_app.cheats_button);
+            }
             return 0;
         }
         if (id == IDC_CTRLREFRESH && code == BN_CLICKED) {

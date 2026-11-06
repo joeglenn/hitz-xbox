@@ -654,3 +654,19 @@ void recomp_unimpl(const char *text, uint32_t va)
     }
     if (stop) abort();
 }
+
+/* ── Built-in cheats from the launcher (cheats.c) ───────────────────────
+ * 0x999B0 returns the settings block of the object in ecx (ecx + 0x110).
+ * For the game's settings manager (MEM32(0x4EB8E4)) that is the current
+ * settings, read by the menus and the match set-up: force the launcher's
+ * cheats into it on the way out. Nothing changes when no cheat is set. */
+#include "cheats.h"
+extern void sub_000999B0_gen(void);
+
+void sub_000999B0(void)
+{
+    uint32_t self = g_ecx;
+    sub_000999B0_gen();
+    if (self && self == *(volatile uint32_t *)(g_xbox_mem_offset + 0x4EB8E4u))
+        hitz_cheats_apply(g_eax);
+}
