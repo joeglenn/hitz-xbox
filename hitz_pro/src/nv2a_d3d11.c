@@ -454,7 +454,24 @@ typedef struct {
     uint32_t key, w, h;
     ID3D11Texture2D *tex;
     ID3D11DepthStencilView *dsv;
+    ID3D11ShaderResourceView *dsrv, *ssrv;   /* depth, stencil as textures */
+    uint32_t last_frame;
+    ID3D11Texture2D *ztex;                   /* the game's view of it (A8B8G8R8) */
+    ID3D11RenderTargetView *zrtv;
+    ID3D11ShaderResourceView *zsrv;
+    uint32_t zw, zh;
 } DS;
+static void ds_release(DS *d)
+{
+    if (d->zsrv) ID3D11ShaderResourceView_Release(d->zsrv);
+    if (d->zrtv) ID3D11RenderTargetView_Release(d->zrtv);
+    if (d->ztex) ID3D11Texture2D_Release(d->ztex);
+    if (d->dsrv) ID3D11ShaderResourceView_Release(d->dsrv);
+    if (d->ssrv) ID3D11ShaderResourceView_Release(d->ssrv);
+    if (d->dsv) ID3D11DepthStencilView_Release(d->dsv);
+    if (d->tex) ID3D11Texture2D_Release(d->tex);
+    memset(d, 0, sizeof *d);
+}
 #define MAX_DS 8
 static DS s_ds[MAX_DS];
 
@@ -578,9 +595,7 @@ static DS *ds_get(uint32_t zeta_va, uint32_t w, uint32_t h)
         if (s_ds[i].tex && s_ds[i].key == key) {
             if (s_ds[i].w >= w && s_ds[i].h >= h) return &s_ds[i];
             if (s_q_ok > 0) qflush();
-            ID3D11DepthStencilView_Release(s_ds[i].dsv);
-            ID3D11Texture2D_Release(s_ds[i].tex);
-            memset(&s_ds[i], 0, sizeof s_ds[i]);
+            ds_release(&s_ds[i]);
             slot = i;
             break;
         }
@@ -589,15 +604,26 @@ static DS *ds_get(uint32_t zeta_va, uint32_t w, uint32_t h)
     if (slot < 0) {
         slot = 0;
         if (s_q_ok > 0) qflush();
-        ID3D11DepthStencilView_Release(s_ds[0].dsv);
-        ID3D11Texture2D_Release(s_ds[0].tex);
+        ds_release(&s_ds[0]);
     }
     memset(&td, 0, sizeof td);
     td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    td.Format = DXGI_FORMAT_R32G8X24_TYPELESS; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ds[slot].tex))) return NULL;
-    ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)s_ds[slot].tex, NULL, &s_ds[slot].dsv);
+    {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+        memset(&dv, 0, sizeof dv);
+        dv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)s_ds[slot].tex, &dv, &s_ds[slot].dsv);
+        memset(&sv, 0, sizeof sv);
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
+        sv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_ds[slot].tex, &sv, &s_ds[slot].dsrv);
+        sv.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_ds[slot].tex, &sv, &s_ds[slot].ssrv);
+    }
     s_ds[slot].key = key; s_ds[slot].w = w; s_ds[slot].h = h;
     ID3D11DeviceContext_ClearDepthStencilView(s_ctx, s_ds[slot].dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
     return &s_ds[slot];
@@ -746,6 +772,96 @@ static int fast_decode(const Nv2aStage *t, uint32_t *out)
     return 1;
 }
 
+static ID3D11VertexShader *s_z_vs;
+static ID3D11PixelShader *s_z_ps;
+static int s_z_ok;               /* 0 untried, 1 ready, -1 unavailable */
+static unsigned s_z_reads;
+static const char s_z_hlsl[] =
+    "Texture2D<float> dz : register(t0);\n"
+    "Texture2D<uint2> st : register(t1);\n"
+    "void vs(uint id : SV_VertexID, out float4 p : SV_Position) {\n"
+    "  float2 t = float2((id << 1) & 2, id & 2);\n"
+    "  p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+    "}\n"
+    "float4 ps(float4 p : SV_Position) : SV_Target {\n"
+    "  int2 q = int2(p.xy);\n"
+    "  uint z = (uint)round(saturate(dz.Load(int3(q, 0))) * 16777215.0);\n"
+    "  uint s8 = st.Load(int3(q, 0)).y & 255;\n"
+    "  return float4(s8, z & 255, (z >> 8) & 255, z >> 16) / 255.0;\n"
+    "}\n";
+
+static int z_init(void)
+{
+    ID3DBlob *b = NULL;
+    HRESULT hr;
+    if (s_z_ok) return s_z_ok > 0;
+    s_z_ok = -1;
+    if (FAILED(D3DCompile(s_z_hlsl, sizeof s_z_hlsl - 1, "zread", NULL, NULL, "vs", "vs_5_0", 0, 0, &b, NULL))) return 0;
+    hr = ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &s_z_vs);
+    ID3D10Blob_Release(b);
+    if (FAILED(hr)) return 0;
+    if (FAILED(D3DCompile(s_z_hlsl, sizeof s_z_hlsl - 1, "zread", NULL, NULL, "ps", "ps_5_0", 0, 0, &b, NULL))) return 0;
+    hr = ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &s_z_ps);
+    ID3D10Blob_Release(b);
+    if (FAILED(hr)) return 0;
+    s_z_ok = 1;
+    return 1;
+}
+
+/* A texture at a depth buffer's address, drawn with lately: the depth as the
+ * Xbox stores it, NULL: not a depth buffer. */
+static ID3D11ShaderResourceView *z_as_texture(const Nv2aStage *t)
+{
+    uint32_t key = KEY(t->offset), i, w, h;
+    DS *d = NULL;
+    D3D11_VIEWPORT vp;
+    ID3D11ShaderResourceView *sr[2], *none[2] = { NULL, NULL };
+    for (i = 0; i < MAX_DS; i++)
+        if (s_ds[i].tex && s_ds[i].key == key && s_ds[i].last_frame + 2 >= s_frame) { d = &s_ds[i]; break; }
+    if (!d || t->cube || !d->dsrv || !d->ssrv || !z_init()) return NULL;
+    w = t->width; h = t->height;
+    if (w > d->w) w = d->w;
+    if (h > d->h) h = d->h;
+    if (!d->ztex || d->zw != w || d->zh != h) {
+        D3D11_TEXTURE2D_DESC td;
+        if (s_q_ok > 0) qflush();
+        if (d->zsrv) ID3D11ShaderResourceView_Release(d->zsrv);
+        if (d->zrtv) ID3D11RenderTargetView_Release(d->zrtv);
+        if (d->ztex) ID3D11Texture2D_Release(d->ztex);
+        d->zsrv = NULL; d->zrtv = NULL; d->ztex = NULL;
+        memset(&td, 0, sizeof td);
+        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &d->ztex))
+            || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)d->ztex, NULL, &d->zrtv))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)d->ztex, NULL, &d->zsrv)))
+            return NULL;
+        d->zw = w; d->zh = h;
+    }
+    /* everything drawn so far reaches the depth buffer first */
+    if (s_q_ok > 0) qflush();
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &d->zrtv, NULL);
+    vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (FLOAT)w; vp.Height = (FLOAT)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetState(s_ctx, NULL);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_z_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_z_ps, NULL, 0);
+    sr[0] = d->dsrv; sr[1] = d->ssrv;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, sr);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, none);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    if (!s_z_reads++)
+        fprintf(stderr, "[D3D11] depth buffer 0x%08X read as a texture (%ux%u, format 0x%X): made from the GPU depth\n",
+                t->offset, t->width, t->height, t->color);
+    return d->zsrv;
+}
+
 static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cube)
 {
     uint32_t key = KEY(t->offset), i, h, slot = MAX_TEX, lru = 0;
@@ -759,6 +875,10 @@ static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cub
     size_t up_bytes = 0;            /* what actually goes to the GPU */
 
     *is_cube = 0;
+    {
+        ID3D11ShaderResourceView *zv = z_as_texture(t);
+        if (zv) return zv;
+    }
     rt = rt_find_key(key);
     if (rt && !t->cube && rt->last_frame + 2 >= s_frame) {   /* render-to-texture */
         s_st.rt_alias++;
@@ -1852,6 +1972,7 @@ static RT *prepare(const Nv2aSurface *s, const Nv2aBatchX *b, int prog, QDraw *q
     if (!r) return NULL;
     if (rs->zeta_va && (rs->depth_test_enable || rs->depth_write || rs->stencil_enable))
         d = ds_get(rs->zeta_va, r->w, r->h);
+    if (d) d->last_frame = s_frame;
     memset(q, 0, sizeof *q);
 
     memset(&cb, 0, sizeof cb);
