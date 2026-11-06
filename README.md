@@ -243,7 +243,7 @@ You only need these to change behaviour or to debug. `main.c` and `run_hitz.bat`
 
 | Variable | What it does |
 |---|---|
-| `RECOMP_USB_PADS=1..4` | number of controller ports (default 2; the launcher's Players setting) |
+| `RECOMP_USB_PADS=1..2` | number of controller ports (default 2; the launcher's Players setting -- the game plays two) |
 | `RECOMP_KEYBOARD=1` | keyboard as pad 1 |
 | `HITZ_GPU_CULL=1` | back-face culling on the GPU (the CPU path never culled; try it if a scene looks wrong) |
 | `HITZ_GPU_BC=0` | decode DXT textures on the CPU instead of uploading them compressed (debug) |

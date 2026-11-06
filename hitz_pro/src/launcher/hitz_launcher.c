@@ -172,8 +172,9 @@ static const LPCWSTR k_picture_disp[] = { L"Smooth", L"Sharp pixels" };
 static const LPCWSTR k_pacing_ini[]  = { L"auto", L"timer" };
 static const LPCWSTR k_pacing_disp[] = { L"Match display (recommended)", L"Game timer (old behaviour)" };
 
-static const LPCWSTR k_players_ini[] = { L"1", L"2", L"3", L"4" };
-static const LPCWSTR k_players_disp[] = { L"1", L"2", L"3", L"4" };
+/* the game has two controller slots in play: more ports only confuse it */
+static const LPCWSTR k_players_ini[] = { L"1", L"2" };
+static const LPCWSTR k_players_disp[] = { L"1", L"2" };
 
 /* Index order below matches the SettingIndex enum. Keep in sync. */
 static const SettingDef g_settings[] = {
@@ -188,7 +189,7 @@ static const SettingDef g_settings[] = {
     { L"refresh_switch", L"HITZ_REFRESH_SWITCH", L"1",      NULL, NULL, NULL,
       0, L"Fullscreen: switch the monitor to 60/120 Hz (smoother)", IDC_REFRESH },
     { L"players",        L"RECOMP_USB_PADS", L"2",          k_players_ini, NULL,          k_players_disp,
-      4, L"Players:", IDC_PLAYERS },
+      2, L"Players:", IDC_PLAYERS },
     { L"keyboard",       L"RECOMP_KEYBOARD", L"0",          NULL, NULL, NULL,
       0, L"Keyboard controls player 1", IDC_KEYBOARD },
     { L"sdl_pads",       L"HITZ_SDL_PADS", L"1",            NULL, NULL, NULL,
@@ -774,6 +775,12 @@ static void LoadSettingIntoControl(HWND hwnd, int index)
 
     for (int i = 0; i < d->count; i++) {
         if (_wcsicmp(g_app.settings.values[index], d->ini_values[i]) == 0) {
+            SendMessageW(ctrl, CB_SETCURSEL, (WPARAM)i, 0);
+            return;
+        }
+    }
+    for (int i = 0; i < d->count; i++) {
+        if (_wcsicmp(d->default_ini_value, d->ini_values[i]) == 0) {
             SendMessageW(ctrl, CB_SETCURSEL, (WPARAM)i, 0);
             return;
         }
