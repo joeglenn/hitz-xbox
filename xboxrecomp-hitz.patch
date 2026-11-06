@@ -2696,9 +2696,18 @@ index bd00f3f..5f92255 100644
      const XBOX_GAMEPAD *g;
      uint8_t synth = synthetic_buttons();
 diff --git a/src/video/fb_present.c b/src/video/fb_present.c
-index 3430107..af0d28b 100644
+index 3430107..1ed06c8 100644
 --- a/src/video/fb_present.c
 +++ b/src/video/fb_present.c
+@@ -17,7 +17,7 @@
+  * The window opens at RECOMP_WINDOW_SCALE times the frame (default 2, made
+  * smaller until it fits the desktop) and can be resized; the frame is
+  * letterboxed to its 4:3 shape. F11 or Alt+Enter toggles borderless
+- * fullscreen, RECOMP_FULLSCREEN=1 starts in it. Closing the window ends the
++ * fullscreen (Esc leaves it), RECOMP_FULLSCREEN=1 starts in it. Closing the window ends the
+  * process, as the SDL window does.
+  *
+  * Off unless RECOMP_FB_WINDOW is set.
 @@ -28,6 +28,7 @@
  #include <windows.h>
  #include <stdio.h>
@@ -2768,7 +2777,19 @@ index 3430107..af0d28b 100644
  }
  
  void xbox_FramebufferWindowFrameStats(uint32_t draws)
-@@ -242,7 +262,11 @@ static void fb_toggle_fullscreen(HWND h)
+@@ -225,9 +245,10 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
+ /* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
+  * (DXGI's own Alt+Enter, exclusive mode at the frame's 640x480, is off --
+  * gpu_present.c; both presenters letterbox to any size.) */
++static int s_fb_full;              /* borderless fullscreen now */
+ static void fb_toggle_fullscreen(HWND h)
+ {
+-    static int full;
++#define full s_fb_full
+     static RECT saved;
+     static LONG_PTR saved_style;
+     if (!full) {
+@@ -242,12 +263,17 @@ static void fb_toggle_fullscreen(HWND h)
                       mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
                       SWP_FRAMECHANGED | SWP_SHOWWINDOW);
          full = 1;
@@ -2780,10 +2801,22 @@ index 3430107..af0d28b 100644
          SetWindowLongPtrA(h, GWL_STYLE, saved_style);
          SetWindowPos(h, NULL, saved.left, saved.top, saved.right - saved.left,
                       saved.bottom - saved.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW);
-@@ -261,6 +285,18 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+         full = 0;
+     }
++#undef full
+ }
+ 
+ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+@@ -261,6 +287,24 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
      }
      if (m == WM_SYSKEYDOWN && w == VK_RETURN)
          return 0;                       /* auto-repeat of Alt+Enter */
++    /* Esc in fullscreen: back to the window (not passed to the game). */
++    if ((m == WM_KEYDOWN || m == WM_KEYUP) && w == VK_ESCAPE && s_fb_full) {
++        if (m == WM_KEYDOWN && !(l & (1 << 30)))
++            fb_toggle_fullscreen(h);
++        return 0;
++    }
 +    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30))) {
 +        /* A mark in the performance log: "it stuttered just now". */
 +        int n = xbox_PerfMark();
@@ -2799,7 +2832,7 @@ index 3430107..af0d28b 100644
      switch (m) {
      case WM_CLOSE:
      case WM_DESTROY:
-@@ -275,6 +311,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+@@ -275,6 +319,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
          InterlockedExchange(&s_fb_running, 0);
          if (!getenv("RECOMP_CLOSE_KEEPS_RUNNING")) {
              fprintf(stderr, "  [FBWIN] window closed: exiting\n");
@@ -2807,7 +2840,7 @@ index 3430107..af0d28b 100644
              recomp_exit_hook_run("window");
              fflush(stdout);
              fflush(stderr);
-@@ -543,24 +580,48 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -543,24 +588,48 @@ static DWORD WINAPI fb_thread(LPVOID unused)
  
      fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
              s_fb_width, s_fb_height);
@@ -2860,7 +2893,7 @@ index 3430107..af0d28b 100644
              if (!fb_pinned)
                  fb_overlay();
              paced = fb_show(hwnd, hdc, &bi);
-@@ -601,13 +662,23 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -601,13 +670,23 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              static DWORD t0;
              static LONG f0;
              DWORD now = GetTickCount();
@@ -2886,7 +2919,7 @@ index 3430107..af0d28b 100644
                  SetWindowTextW(hwnd, tb);
                  t0 = now; f0 = f;
              }
-@@ -634,6 +705,9 @@ void xbox_FramebufferWindowStart(void)
+@@ -634,6 +713,9 @@ void xbox_FramebufferWindowStart(void)
          return;
      if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
          return;
