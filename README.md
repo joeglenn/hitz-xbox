@@ -198,6 +198,26 @@ The game runs at 60 frames a second. To show every frame for the same length of 
 
 ---
 
+## Cheats
+
+The game's own five cheats are in the launcher: press **Cheats...** (left of
+Play). No need to type the codes as profile names.
+
+| Cheat | Choices | The game's code |
+|---|---|---|
+| Player heads | Normal, Big, Huge | HERK |
+| Team heads | Normal, Big, Huge | INGY |
+| Puck size | Normal, 1 to 10 (+15% each, up to 2.5x) | 211S |
+| Puck shadow | Off, On | SASG |
+| Puck glow | Off, Green, Yellow, Red, Blue | CARB |
+
+*Game setting* (the default) leaves a cheat to the game's own Cheats menu
+(Settings > Game Tuning > Visuals > Cheats). Puck size also changes the puck's
+collision size, so it plays differently, not only looks different.
+The launcher passes them as `HITZ_CHEAT_PLAYER_HEAD`, `HITZ_CHEAT_TEAM_HEAD`
+(`normal|big|huge`), `HITZ_CHEAT_PUCK_SIZE` (`0`-`10`), `HITZ_CHEAT_PUCK_SHADOW`
+(`off|on`), `HITZ_CHEAT_PUCK_GLOW` (`off|green|yellow|red|blue`).
+
 ## Controls
 
 **Xbox controllers** (360/One/Series, and anything in XInput mode) map one-to-one to the Xbox pad.

@@ -401,3 +401,13 @@ The launcher's Diagnostics box is now **Debug logging** (`debug` in hitz_setting
 ## 2026-11-07: README "How this was made"
 
 - Section on the tools, the development setup and the AI involved (Claude Opus in the Hermes agent; Real-ESRGAN for the HD edition's assets).
+
+## 2026-11-07: built-in cheats in the launcher
+
+- The five profile-name cheats (pkChooseTeams 0xE50D0: HERK, INGY, 211S, SASG, CARB, then "CHEAT UNLOCKED") set bits 0-4 of the unlock mask at +0x434 of the current settings block, `MEM32(MEM32(0x4EB8E4) + 0x110)` (getter 0x999B0; profiles are copied in by 0x999C0).
+- Values by menu id (getter switch 0xF7040, setter 0xF7440, Cheats menu 0xF8A13): 0x33 player head +0x3E0 (Normal/Big/HUGE), 0x34 team head +0x3E8, 0x35 puck size +0x3F8 (slider 0-10), 0x36 puck shadow +0x40C (Off/On), 0x38 puck glow +0x3F4 (Off/Green/Yellow/Red/Blue).
+- The puck size setter also stores the size as a float at 0x4E79C8 (bss); match set-up 0xBC750 makes scale = 1 + 0.15 * size, which sizes the puck model and its collision radius (0x5922AC/B0). Gameplay, not only looks.
+- `src/cheats.c` + an override of 0x999B0 in `recomp_manual.c`: when the getter is asked for the settings manager's block, the HITZ_CHEAT_* values and unlock bits are written into it (and the float). New override = full regeneration once.
+- Launcher: `src/launcher/launcher_cheats.c`, a Cheats window opened from a button created left of Play (no layout code per edition), ini keys `cheat_*`.
+- Netplay: player 1's KEYOK carries 8 option bytes (its cheats); player 2 waits for them and plays with them. HELLOs could not carry them: the relay pairs players without HELLOs (first attempt desynced at frame 120 with the joiner on "no cheats").
+- Tests: attract demo with cheats (huge heads on every player, big red-glowing puck) vs without; relay and direct matches with cheats on the host only: no desync, 60 fps.
