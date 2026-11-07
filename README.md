@@ -353,6 +353,7 @@ You only need these to change behaviour or to debug. `main.c` and `run_hitz.bat`
 | `HITZ_HOSTPROF=1` | sampling profiler writing `C:\proj\hprof.txt`; resolve it with `tools/hostprof_resolve.py` |
 | `HITZ_DIAG=1` | bring-up diagnostics in `recomp_manual.c` |
 | `RECOMP_DRAW_LOG`, `RECOMP_PATH_LOG`, `RECOMP_READ_LOG`, `RECOMP_GPU_REPORT` | verbose toolkit logs (slow) |
+| `HITZ_GPU_CB_FALLBACK=1` | renderer: skip the D3D11.1 constant-buffer ring and update constants per draw (used automatically on drivers without it; for testing) |
 | `RECOMP_WATCHDOG_SECS=N` | dump guest state if the game hasn't exited after N seconds |
 | `RECOMP_PAD_SCRIPT=<ms>:<button>[:hold],...` | scripted input for unattended tests, e.g. `58000:start,64000:start,72000:a`. `p2-` targets pad 2. |
 

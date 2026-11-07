@@ -418,4 +418,8 @@ The launcher's Diagnostics box is now **Debug logging** (`debug` in hitz_setting
 - Checked mechanically, per edition, against the code before the pass: C compared token by token after the compiler's own comment stripping (`gcc -fpreprocessed -dD -E -P`), Python by syntax tree without docstrings, scripts with comment lines removed; the recompiler's scan of `recomp_manual.c` must give the same sets; added text ASCII only. Regenerated toolkit patches give the same code once applied.
 - `recomp_manual.c` comments name game functions by address only (the recompiler reads `sub_XXXXXXXX` names in comments).
 - The anchor scripts in tools/hd were written against the sources before this pass; re-running apply_hd.sh from scratch may need their anchors updated where a comment now sits inside one.
-- Oddities noticed while documenting (not changed): `nv2a_pb_scan.c` compares `RECOMP_GPU_REPORT`'s first character with the number 1 rather than '1', so the report never switches on; the renderer's GPU draw queue needs D3D 11.1 constant-buffer offsets and has no fallback; the launcher's Cheats button finds Play by the literal id 1014; `hm_init` sets the movie thread's priority twice.
+- Found while documenting, then fixed:
+  - `nv2a_pb_scan.c` (toolkit patch) compared `RECOMP_GPU_REPORT`'s first character with the number 1 rather than '1', so the survey never switched on.
+  - The renderer's draw queue needed D3D11.1 constant-buffer offsetting: without it `q_init()` failed and every queued draw was dropped (black screen), while the log claimed "per-draw renames". Now there is that fallback: constants are recorded in a CPU-only window and copied into the per-draw buffers `s_cb` / `s_vcb` / `s_vpb` at replay. `HITZ_GPU_CB_FALLBACK=1` forces it for testing.
+  - The Cheats button looked Play up by the literal id 1014; the launcher now passes `IDC_PLAY`.
+  - HD: `hm_init` set the movie thread's priority twice.

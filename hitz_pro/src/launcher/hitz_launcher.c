@@ -1341,7 +1341,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         g_app.dpi = dpi;
         CreateAllControls(hwnd, inst, dpi);
-        g_app.cheats_button = Cheats_CreateButton(hwnd, inst, IDC_CHEATS, dpi);
+        g_app.cheats_button = Cheats_CreateButton(hwnd, inst, IDC_CHEATS, IDC_PLAY, dpi);
         PopulateCombos();
         LoadBoolControls();
         EnumerateGpuAdapters(g_app.gpu_combo);

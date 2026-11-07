@@ -2043,10 +2043,18 @@ static ID3D11Buffer *s_cring;
 static UINT s_cring_size, s_cring_pos, s_cring_gen;
 static uint8_t *s_cring_map;
 static int s_cring_ok = -1;
+/* 1 = the constant-buffer ring is not used: the GPU or driver lacks D3D11.1
+ * constant-buffer offsetting (or HITZ_GPU_CB_FALLBACK=1 asks for this path,
+ * for testing). Constants are then recorded in a CPU-only ring window and
+ * copied into s_cb / s_vcb / s_vpb (WRITE_DISCARD) as qflush() replays each
+ * draw. Slower on drivers that throttle many renames per frame, but every
+ * draw still happens. Set once by q_init(). */
+static int s_cb_fallback;
 /* Checks for D3D11.1 constant-buffer-offsetting support and, if present,
- * creates the constant-buffer ring (s_cring). Without that support q_init()
- * (and so every draw) fails entirely: there is no per-draw-rename fallback
- * path. Safe to call repeatedly: caches its result. */
+ * creates the constant-buffer ring (s_cring). Without it the draw queue uses
+ * the fallback (see s_cb_fallback): each draw's constants are copied into
+ * the small per-draw buffers s_cb / s_vcb / s_vpb while the queue replays.
+ * Safe to call repeatedly: caches its result. */
 static int cring_init(void)
 {
     D3D11_BUFFER_DESC bd;
@@ -2057,7 +2065,7 @@ static int cring_init(void)
     memset(&o, 0, sizeof o);
     ID3D11Device_CheckFeatureSupport(s_dev, D3D11_FEATURE_D3D11_OPTIONS, &o, sizeof o);
     if (!o.ConstantBufferOffsetting || !o.MapNoOverwriteOnDynamicConstantBuffer) {
-        fprintf(stderr, "[D3D11] no constant-buffer offsetting; per-draw renames\n");
+        fprintf(stderr, "[D3D11] no constant-buffer offsetting; constants updated per draw\n");
         return 0;
     }
     memset(&bd, 0, sizeof bd);
@@ -2129,7 +2137,7 @@ static void ring_upload(Ring *r)
 {
     D3D11_MAPPED_SUBRESOURCE m;
     if (!r->open) return;
-    if (r->used && SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)r->buf, 0,
+    if (r->used && r->buf && SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)r->buf, 0,
                  r->discard ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m))) {
         memcpy((uint8_t *)m.pData + r->base, r->cpu, r->used);
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)r->buf, 0);
@@ -2165,10 +2173,18 @@ static int q_init(void)
 {
     if (s_q_ok >= 0) return s_q_ok;
     s_q_ok = 0;
-    if (!cring_init()) return 0;
+    {
+        const char *e = getenv("HITZ_GPU_CB_FALLBACK");
+        s_cb_fallback = (e && *e == '1') || !cring_init();
+    }
+    if (s_cb_fallback)
+        fprintf(stderr, "[D3D11] draw constants: per-draw buffer updates (no constant-buffer ring)\n");
     s_q = (QDraw *)malloc(sizeof *s_q * QMAX);
+    /* Fallback: the constants ring is CPU-only (no GPU buffer; ring_upload
+     * skips it) and as large as one window, so every window starts at 0. */
     if (!s_q
-        || !ring_setup(&s_rcb, s_cring, s_cring_size, 8u << 20)
+        || !ring_setup(&s_rcb, s_cb_fallback ? NULL : s_cring,
+                       s_cb_fallback ? (8u << 20) : s_cring_size, 8u << 20)
         || !ring_setup(&s_rvb, s_vb, s_vb_size, 12u << 20)
         || !ring_setup(&s_rraw, s_raw, s_raw_size, 24u << 20)
         || !ring_setup(&s_rib, s_ib, s_ib_size, 6u << 20))
@@ -2187,6 +2203,23 @@ static int q_init(void)
  * uploads the rings even when the queue is empty, so a reserved-but-unused
  * window (see be_draw_x()/be_draw_vsh()'s "may flush: nothing reserved yet"
  * comments) does not leak into the next one. */
+/* Fallback path (s_cb_fallback): copies `width` bytes of constants that a
+ * queued draw recorded at constant index `first` (16-byte units, as in
+ * QDraw.cb0/cb1/cb2) from the constants ring's CPU window into `buf` with
+ * WRITE_DISCARD. Only valid during qflush(): the window still holds the
+ * batch being replayed. The copy is clamped to the window. */
+static void cb_put(ID3D11Buffer *buf, UINT first, UINT width)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    UINT off = first * 16 - s_rcb.base;
+    if (off >= s_rcb.cap) return;
+    if (width > s_rcb.cap - off) width = s_rcb.cap - off;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, s_rcb.cpu + off, width);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)buf, 0);
+    }
+}
+
 static void qflush(void)
 {
     static QDraw last;
@@ -2226,8 +2259,14 @@ static void qflush(void)
         if (f || d->dss != last.dss || d->sref != last.sref)
             ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, d->dss, d->sref);
         if (f || d->cb0 != last.cb0) {
-            ID3D11DeviceContext1_VSSetConstantBuffers1(s_ctx1, 0, 1, &s_cring, &d->cb0, &d->n0);
-            ID3D11DeviceContext1_PSSetConstantBuffers1(s_ctx1, 0, 1, &s_cring, &d->cb0, &d->n0);
+            if (s_cb_fallback) {
+                cb_put(s_cb, d->cb0, (sizeof(CBData) + 15) & ~15u);
+                ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+                ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+            } else {
+                ID3D11DeviceContext1_VSSetConstantBuffers1(s_ctx1, 0, 1, &s_cring, &d->cb0, &d->n0);
+                ID3D11DeviceContext1_PSSetConstantBuffers1(s_ctx1, 0, 1, &s_cring, &d->cb0, &d->n0);
+            }
         }
         if (f || d->prog != last.prog) {
             ID3D11DeviceContext_IASetInputLayout(s_ctx, d->prog ? NULL : s_il);
@@ -2235,9 +2274,17 @@ static void qflush(void)
         }
         if (d->prog) {
             if (f || d->cb1 != last.cb1 || d->cb2 != last.cb2 || !last.prog) {
-                ID3D11Buffer *rb[2] = { s_cring, s_cring };
-                UINT ff[2] = { d->cb1, d->cb2 }, nn[2] = { d->n1, d->n2 };
-                ID3D11DeviceContext1_VSSetConstantBuffers1(s_ctx1, 1, 2, rb, ff, nn);
+                if (s_cb_fallback) {
+                    /* slot 1: VCData; slot 2: the vertex program (136 slots) */
+                    ID3D11Buffer *fb[2] = { s_vcb, s_vpb };
+                    cb_put(s_vcb, d->cb1, (sizeof(VCData) + 15) & ~15u);
+                    cb_put(s_vpb, d->cb2, 136 * 16);
+                    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 1, 2, fb);
+                } else {
+                    ID3D11Buffer *rb[2] = { s_cring, s_cring };
+                    UINT ff[2] = { d->cb1, d->cb2 }, nn[2] = { d->n1, d->n2 };
+                    ID3D11DeviceContext1_VSSetConstantBuffers1(s_ctx1, 1, 2, rb, ff, nn);
+                }
             }
             gprof_begin_draw(1);
             ID3D11DeviceContext_DrawIndexed(s_ctx, d->icount, d->ifirst, 0);

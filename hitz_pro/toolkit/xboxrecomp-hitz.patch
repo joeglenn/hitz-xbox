@@ -2120,7 +2120,7 @@ index a513bc7..1b74604 100644
 +    return 1;
 +}
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
-index e3a16e2..5a2d72b 100644
+index e3a16e2..06dfa78 100644
 --- a/src/kernel/nv2a_pb_scan.c
 +++ b/src/kernel/nv2a_pb_scan.c
 @@ -19,6 +19,14 @@
@@ -2164,7 +2164,7 @@ index e3a16e2..5a2d72b 100644
 +    {   /* The executor survey (and its [GPU]/[TEXUSE] lines) is a bring-up
 +         * report: it costs the executor thread several percent. Opt in. */
 +        static int on = -1;
-+        if (on < 0) { const char *e = getenv("RECOMP_GPU_REPORT"); on = e && *e == 1; }
++        if (on < 0) { const char *e = getenv("RECOMP_GPU_REPORT"); on = e && *e == '1'; }
 +        if (!on) return;
 +    }
  

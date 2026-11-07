@@ -31,8 +31,9 @@ BOOL Cheats_IsKnownIniKey(LPCWSTR key);
 BOOL Cheats_Env(int i, LPCWSTR *name, LPWSTR value, size_t cap);
 /* Number of cheats currently set to something other than "Game setting". */
 int  Cheats_ActiveCount(void);
-/* Create the "Cheats..." button just left of the Play button. */
-HWND Cheats_CreateButton(HWND parent, HINSTANCE inst, int id, UINT dpi);
+/* Create the "Cheats..." button (control id `id`) just left of the Play
+ * button, which must already exist as control `play_id` of parent. */
+HWND Cheats_CreateButton(HWND parent, HINSTANCE inst, int id, int play_id, UINT dpi);
 /* Show "Cheats..." / "Cheats (2 on)..." on the button. */
 void Cheats_UpdateButton(HWND button);
 /* The cheats window, modal over owner. TRUE = the player pressed OK. */

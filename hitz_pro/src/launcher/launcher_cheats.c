@@ -161,15 +161,14 @@ void Cheats_UpdateButton(HWND button)
 }
 
 /* Creates the "Cheats..." push button positioned just to the left of the
- * Play button (control id 1014, IDC_PLAY in hitz_launcher.c; hardcoded here
- * rather than shared via the header, since launcher_cheats.h intentionally
- * has no dependency on hitz_launcher.c's control-id defines), and sets its
+ * Play button (control id play_id, which the launcher passes as its
+ * IDC_PLAY, so this module needs none of its control-id defines), and sets its
  * initial label via Cheats_UpdateButton. Returns NULL if the Play button
  * cannot be found or its rect cannot be read (should not happen: the
  * launcher always creates Play before calling this). */
-HWND Cheats_CreateButton(HWND parent, HINSTANCE inst, int id, UINT dpi)
+HWND Cheats_CreateButton(HWND parent, HINSTANCE inst, int id, int play_id, UINT dpi)
 {
-    HWND play = GetDlgItem(parent, 1014);           /* IDC_PLAY */
+    HWND play = GetDlgItem(parent, play_id);
     RECT r;
     HWND b;
     int w = Px(120, dpi), gap = Px(12, dpi);
