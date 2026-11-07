@@ -172,8 +172,8 @@ Setup builds both programs on your PC from source (this repo plus the xboxrecomp
 3. SmartScreen's "Windows protected your PC" is the same lack of reputation: More info -> **Run anyway**.
 
 **Check it yourself:** upload `HitzLauncher.exe` to [VirusTotal](https://www.virustotal.com) to have about
-70 antivirus engines scan it. Don't upload `hitz_pro_recomp.exe`: it contains the recompiled game, and
-VirusTotal shares uploads with security companies.
+70 antivirus engines scan it. Don't upload `hitz_pro_recomp.exe`: it contains the recompiled game, which
+is copyrighted, and VirusTotal shares every upload with security companies.
 
 ---
 
