@@ -150,6 +150,33 @@ Options:
 
 ---
 
+## If Windows calls it a virus
+
+Windows Defender sometimes reports `HitzLauncher.exe` or `hitz_pro_recomp.exe` as a trojan, usually with a
+name ending in `!ml` (for example `Trojan:Win32/Wacatac.B!ml`). It's a false positive:
+
+- `!ml` means Microsoft's machine-learning guess, not a match with known malware.
+- The programs aren't signed with a code-signing certificate, and every build is a file Microsoft has
+  never seen, so they have no reputation yet.
+- They do things the guess links to malware: it starts another program (the game) with its console hidden and passes it settings through environment variables. The game also reserves large fixed memory ranges
+  and catches its own memory-access faults, which is how the recompiled Xbox code runs.
+
+Setup builds both programs on your PC from source (this repo plus the xboxrecomp toolkit's source), with Visual Studio. The only ready-made programs it downloads come from their projects' own release pages: uv and Python, and SDL2.
+
+**What to do:**
+1. Windows Security -> Virus & threat protection -> **Protection history**: open the entry, then
+   Actions -> **Restore** (or **Allow on device**). Optionally add the game folder under Exclusions.
+2. Report it to Microsoft at https://www.microsoft.com/wdsi/filesubmission ("Incorrectly detected as
+   malware"), with the threat name from Protection history. Once Microsoft clears a file, Defender stops
+   flagging it.
+3. SmartScreen's "Windows protected your PC" is the same lack of reputation: More info -> **Run anyway**.
+
+**Check it yourself:** upload `HitzLauncher.exe` to [VirusTotal](https://www.virustotal.com) to have about
+70 antivirus engines scan it. Don't upload `hitz_pro_recomp.exe`: it contains the recompiled game, and
+VirusTotal shares uploads with security companies.
+
+---
+
 ## Manual steps (what setup does)
 
 You only need this section to understand or debug the setup script. The manual build additionally needs Python 3.10+ with `capstone` (`pip install capstone`).
