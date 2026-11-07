@@ -28,6 +28,35 @@
  *   Code size:   ~??? KB (.text)
  *   Sections:    ?? (list them)
  *   Kernel imports: ??
+ *
+ * Environment variables read here (see also NOTES.md and README.md):
+ *   HITZ_DEBUG       - "1" turns on debug logging (hitz_stderr.log via the
+ *                      launcher/run_hitz.bat, hitz_perf.log, renderer timers);
+ *                      off by default, in which case nothing is logged and a
+ *                      crash still produces hitz_crash.log.
+ *   HITZ_LOG_DIRECT  - "1" writes stderr directly instead of through the
+ *                      background pump thread below.
+ *   HITZ_PACING, HITZ_REFRESH_SWITCH, HITZ_PERF_LOG, HITZ_SDL_PADS
+ *                    - launcher-facing names, mapped here onto the toolkit's
+ *                      RECOMP_* names with defaults, only if the RECOMP_*
+ *                      name is not already set.
+ *   RECOMP_TITLE_KEVENTS, RECOMP_PB_WALK, RECOMP_FLIP_PACING, RECOMP_PB_EXEC,
+ *   RECOMP_VBLANK, RECOMP_AC97_READY, RECOMP_FB_WINDOW, RECOMP_D3D_PRESENT,
+ *   RECOMP_USB, RECOMP_USB_PADS, HITZ_GPU
+ *                    - toolkit/runtime switches this file defaults to "on"
+ *                      (or a specific value) unless the caller already set
+ *                      them; see the defaults[] table below for what each
+ *                      one does.
+ *   RECOMP_WATCHDOG_SECS - read inside xbox_WatchdogStart(), not here
+ *                      directly; arms the hang watchdog when set.
+ *
+ * Threading model: WinMain and load_xbe run on the process's initial thread,
+ * which goes on to run the guest entry point (xbe_entry_point) and therefore
+ * all recompiled game code. The log pump (s_log_pump) runs on a dedicated
+ * background thread created by hitz_log_async(), guarded by s_log_cs against
+ * the crash-time drain (hitz_log_drain(), called from atexit and from
+ * veh_handler). veh_handler itself runs on whichever thread faults, with
+ * that thread suspended by the OS for the duration.
  */
 
 #include <windows.h>
@@ -237,6 +266,19 @@ static void hitz_crash_log(void)
     g_hitz_log = 1;
 }
 
+/* Vectored exception handler, installed with AddVectoredExceptionHandler so it
+ * runs before any __except in the image. Called by the OS on the thread that
+ * faulted, with that thread already suspended. Only access violations are
+ * examined; anything else falls through to EXCEPTION_CONTINUE_SEARCH so later
+ * handlers (or the default crash dialog) still see it.
+ *
+ * Three outcomes for an access violation, tried in order: a probe into NV2A
+ * MMIO space that this build does not model (silently resumed past the
+ * faulting instruction is not implemented, so the search continues instead);
+ * a trapped hardware register (APU, USB OHCI) that xbox_VehMmioFault can
+ * decode and step over, resuming the guest; otherwise this is a real crash,
+ * so it writes the crash log, the Xbox and native register/stack state, and
+ * drains the async log before giving up the exception. */
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -351,6 +393,10 @@ static void hitz_log_drain(void)
         LeaveCriticalSection(&s_log_cs);
 }
 
+/* Background thread body: reads the in-memory pipe and forwards every chunk
+ * to the real stderr destination under s_log_cs, so a crash-time drain does
+ * not interleave with it. Blocks in ReadFile until something is written or
+ * the write end closes, then returns, ending the thread. */
 static DWORD WINAPI s_log_pump(LPVOID p)
 {
     char buf[16384];
@@ -367,6 +413,14 @@ static DWORD WINAPI s_log_pump(LPVOID p)
     }
 }
 
+/* Sets up the non-blocking stderr path described above: duplicates the
+ * current stderr handle, creates the pipe and the pump thread, then
+ * redirects fd 2 (and the CRT's STD_ERROR_HANDLE) onto the pipe's write end.
+ * Must run before stderr is used for real logging. Any failure along the way
+ * leaves stderr exactly as it was (direct, blocking) and returns without
+ * starting the pump, since a half-built pipe with no reader would stall the
+ * game once it fills. Called once from WinMain, before HITZ_DEBUG is acted
+ * on. A trailing atexit(hitz_log_drain) flushes whatever is left at exit. */
 static void hitz_log_async(void)
 {
     HANDLE wr, th;

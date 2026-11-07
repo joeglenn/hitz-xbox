@@ -3,11 +3,21 @@
 #   ~/hitz-xbox/tools/win11-gpu.sh gpu     # after: sudo gpu-passthrough.sh on
 #   ~/hitz-xbox/tools/win11-gpu.sh plain   # before: sudo gpu-passthrough.sh off
 # Same disk (/home/jbglenn/winvm/storage), ports and credentials as the original container.
+#
+# Rebuilds the dockurr/windows container (a QEMU VM wrapped in a Docker
+# image) from scratch each time, since docker has no "attach a device and
+# keep everything else" update: the base options (common[]) always apply,
+# and "gpu" mode adds QEMU args (extra[]) that pass the already-vfio-bound
+# GPU and its HDMI audio function through as one multifunction PCIe device,
+# plus the host VFIO device nodes and the memory-locking needed for DMA.
 set -eu
 GPU=0000:bc:00.0
 AUD=0000:bc:00.1
 VM=/home/jbglenn/hitz-xbox/vm
 mode=${1:-}
+# Reuse the running container's own PASSWORD env var instead of hardcoding
+# or prompting for it, so recreating the container does not change the
+# login the user already knows.
 pw=$(docker inspect win11 --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^PASSWORD=//p')
 [ -n "$pw" ] || { echo "could not read PASSWORD from the current container"; exit 1; }
 
@@ -45,3 +55,4 @@ docker stop -t 120 win11 >/dev/null || true
 docker rm win11 >/dev/null
 docker run -d "${common[@]}" "${extra[@]}" dockurr/windows
 echo "win11 recreated ($mode). Boot takes ~1-2 min; ssh -p 2222 hitz@127.0.0.1"
+

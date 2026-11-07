@@ -9,6 +9,13 @@
 #
 # In the vfio boot: amdgpu is blacklisted, 1002:1586 (GPU) and 1002:1640 (its HDMI audio) go to
 # vfio-pci, and llama-router + comfyui are masked for that boot only (systemd.mask on the cmdline).
+#
+# Complement to gpu-passthrough.sh: that script toggles the GPU live while
+# the host is running; this one exists because a live unbind of amdgpu
+# crashes this kernel, so instead the GPU never gets an amdgpu binding in
+# the first place for one chosen boot. "setup" is idempotent (checks before
+# appending to each config file); "once" only arms the next boot via
+# grub-reboot, it does not itself reboot the machine.
 set -eu
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 ENTRY="odin-gpu-vfio"

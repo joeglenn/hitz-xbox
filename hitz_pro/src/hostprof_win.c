@@ -7,6 +7,24 @@
  * base on the first line, so a run that gets killed still leaves a profile.
  * Resolve offline against the linker map (/MAP): rva = rip - base.
  * HITZ_HOSTPROF_MS sets the sample interval (default 1).
+ *
+ * Other environment variables, read once in hostprof_start():
+ *   HITZ_HOSTPROF_NOSTACK - disable the call-stack walk for RIPs outside
+ *                      the exe (s_stackwalk); samples there are then
+ *                      recorded as-is instead of attributed to an exe frame.
+ *   HITZ_HOSTPROF_HEAVY - only sample while g_hitz_heavy is set (defined
+ *                      elsewhere in the project), to profile just a known
+ *                      heavy phase.
+ *   HITZ_HOSTPROF_DEPTH - how many exe-side call frames to skip before
+ *                      recording one, when walking out of a non-exe RIP
+ *                      (s_depth, minimum 1); lets a known wrapper function
+ *                      be skipped so time is attributed to its caller.
+ *
+ * Threading model: hostprof_start() runs on the caller's thread (main.c's
+ * WinMain) and only starts the profiler thread (prof_main); all sampling,
+ * stack walking and file output happen on that one profiler thread, which
+ * suspends/resumes the other threads of the process around reading their
+ * context and runs until the process exits.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -20,11 +38,13 @@
 #include <stdint.h>
 
 #define HP_SLOTS (1u << 20)
+/* One histogram entry: a (thread id, RIP) pair seen at least once, and how
+ * many samples hit it. n == 0 marks an unused slot (see record()). */
 typedef struct { uint64_t rip; uint32_t tid; uint32_t n; } HpSlot;
-static HpSlot *s_tab;
-static const char *s_path;
-static DWORD s_self;
-static uint64_t s_exe_lo, s_exe_hi;
+static HpSlot *s_tab;          /* HP_SLOTS-entry open-addressed hash table */
+static const char *s_path;     /* HITZ_HOSTPROF output file path */
+static DWORD s_self;           /* profiler thread's own id, never sampled */
+static uint64_t s_exe_lo, s_exe_hi;  /* [lo, hi) address range of this exe */
 static int s_stackwalk = 1, s_heavy_only, s_depth = 1;
 extern volatile int g_hitz_heavy;
 
@@ -32,6 +52,12 @@ extern volatile int g_hitz_heavy;
 static struct { DWORD tid; HANDLE h; } s_thr[HP_MAXT];
 static int s_nthr;
 
+/* Rescans the process's threads and opens a handle (with suspend/resume and
+ * get-context rights) for every one not already tracked, up to HP_MAXT.
+ * Called about once a second from prof_main, not on every sample, since
+ * enumerating threads is comparatively expensive. Threads that exit are not
+ * removed (their handle just stops showing real activity); failures to
+ * snapshot or open a thread are silently skipped. */
 static void refresh_threads(void)
 {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -61,6 +87,12 @@ static void refresh_threads(void)
     CloseHandle(snap);
 }
 
+/* Adds one sample (thread id, instruction pointer) to the open-addressed
+ * histogram s_tab. Hashes (rip, tid) and linearly probes up to 64 slots
+ * looking for a matching entry to increment or an empty slot to claim; a
+ * sample that cannot find either within 64 probes is dropped (silently: the
+ * table is large enough in practice that this is not expected). Called from
+ * the profiler thread only. */
 static void record(DWORD tid, uint64_t rip)
 {
     uint64_t k = rip * 0x9E3779B97F4A7C15ull ^ tid;
@@ -72,6 +104,11 @@ static void record(DWORD tid, uint64_t rip)
     }
 }
 
+/* Rewrites s_path with the full current histogram: the exe's load base, the
+ * base/size/name of every loaded module (for offline RVA resolution), then
+ * one line per non-empty histogram slot (tid, rip, hit count). Called every
+ * 10 s from the profiler thread so a killed or crashed run still leaves a
+ * usable profile; silently does nothing if s_path cannot be opened. */
 static void dump(void)
 {
     FILE *f = fopen(s_path, "w");
@@ -99,6 +136,16 @@ static void dump(void)
     fclose(f);
 }
 
+/* The profiler thread body: refreshes the thread list about once a second,
+ * then every sample interval suspends each tracked thread (skipping
+ * suspend/resume for ones outside the heavy phase when HITZ_HOSTPROF_HEAVY
+ * is set), reads its RIP, and resumes it. A RIP outside the exe is walked
+ * up the real call stack (RtlVirtualUnwind, falling back to a plain [rsp]
+ * read for frames with no unwind data) until a frame inside the exe is seen
+ * (skipping s_depth-1 of them, so HITZ_HOSTPROF_DEPTH can look further up a
+ * known wrapper), tagged with the top bit so dump()'s consumer can tell an
+ * attributed wait from a direct sample. Writes the histogram file every
+ * 10 s. Runs forever (the process exit ends it); never returns normally. */
 static DWORD WINAPI prof_main(LPVOID arg)
 {
     DWORD ms = 1, last_refresh = 0, last_dump = GetTickCount();
@@ -152,6 +199,12 @@ static DWORD WINAPI prof_main(LPVOID arg)
     return 0;
 }
 
+/* Entry point called once from main.c. A no-op unless HITZ_HOSTPROF names an
+ * output file: then it allocates the histogram, reads the HITZ_HOSTPROF_*
+ * tuning variables, records the exe's address range (for the exe/non-exe
+ * split in prof_main), and starts the profiler thread at time-critical
+ * priority so sampling is not starved by the game itself. Leaves the
+ * profiler disabled (and returns early) if the histogram allocation fails. */
 void hostprof_start(void)
 {
     s_path = getenv("HITZ_HOSTPROF");

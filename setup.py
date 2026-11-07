@@ -13,6 +13,40 @@ Does everything, skipping steps that are already done, so it is safe to rerun:
   6. start the game (--run)
 
 Use the wrappers (setup.bat / setup.sh): they provide Python and capstone.
+
+This module is meant to be run as a script (see main() and the module-level
+constants below), not imported. It is also the thing argparse shows for
+--help, so keep the text above in sync with what the script actually does.
+
+Layout (all paths are derived from this file's own location, ROOT):
+  ROOT/hitz_pro                   PROJ, the game project (this repo)
+  ROOT/hitz_pro/game              GAME, the extracted Xbox disc (step 2)
+  ROOT/hitz_pro/src/recomp/gen    GEN, the generated C code (step 4)
+  ROOT/xboxrecomp                 TOOLKIT, the recompiler toolkit clone (step 1)
+  ROOT/xboxrecomp-hitz.patch      PATCH, the toolkit patch this game needs
+
+Idempotency: each step decides on its own whether it has already run and
+skips itself if so, by checking for marker state on disk rather than a
+single global flag:
+  - step_toolkit: the toolkit is "done" once xboxrecomp/ is checked out at
+    the commit named in hitz_pro/toolkit/BASE_COMMIT and the patch in this
+    repo applies cleanly in reverse (i.e. it is already applied).
+  - step_game: done once hitz_pro/game/default.xbe exists, unless the
+    caller passed --iso or --game to force a re-extraction/copy.
+  - step_generate: done once GEN/.setup_stamp holds the sha256 of the game
+    xbe + the patch + recomp_manual.c, matching the current inputs, and
+    GEN/recomp_funcs.h exists. Changing any of those three things changes
+    the hash and triggers a regeneration; --regen forces one regardless.
+  - step_build: always runs build_windows.bat, which is itself incremental
+    (CMake/Ninja only rebuild what changed).
+
+This script does not read any environment variables itself; it is normally
+launched through setup.sh or setup.bat, which arrange a Python interpreter
+with the capstone package installed (via a local venv or via uv) and then
+exec this file. There is no threading: everything runs on the single main
+thread, and external tools (git, the toolkit's generator scripts, the MSVC
+build) are run synchronously with subprocess.run and are expected to do
+their own job sequentially.
 """
 import argparse
 import hashlib
@@ -40,15 +74,25 @@ IS_WIN = os.name == "nt"
 
 
 def say(msg):
+    """Print a "=== msg" section banner to stdout, flushed immediately."""
     print("\n=== " + msg, flush=True)
 
 
 def die(msg):
+    """Print "[!] msg" to stderr and exit the process with status 1."""
     print("\n[!] " + msg, file=sys.stderr, flush=True)
     sys.exit(1)
 
 
 def run(cmd, cwd=None, check=True, quiet=False):
+    """Run cmd (a list) with subprocess.run, echoing it first unless quiet.
+
+    With quiet=True, stdout/stderr are captured instead of inherited (used
+    for git plumbing calls whose output we parse or only show on failure).
+    With check=True (the default), a non-zero exit calls die(), which ends
+    the whole setup; the captured output (if quiet) is printed first so the
+    failure is not silent. Returns the CompletedProcess either way.
+    """
     if not quiet:
         print("  $ " + " ".join(str(c) for c in cmd), flush=True)
     r = subprocess.run([str(c) for c in cmd], cwd=cwd,
@@ -62,11 +106,21 @@ def run(cmd, cwd=None, check=True, quiet=False):
 
 
 def git(*args, check=True, quiet=True):
+    """Run git against the TOOLKIT clone (git -C TOOLKIT <args>); see run()."""
     return run(["git", "-C", TOOLKIT] + list(args), check=check, quiet=quiet)
 
 
 # ---------------------------------------------------------------- 1. toolkit
 def step_toolkit():
+    """Step 1: clone xboxrecomp if needed, check out BASE_COMMIT, apply PATCH.
+
+    Safe to rerun: if the toolkit is already at BASE_COMMIT with PATCH
+    applied (checked by reverse-applying it with --check), this is a no-op.
+    If the tree has uncommitted changes that look like an older copy of our
+    own patch (see remove_old_patch), they are reversed first so the new
+    patch can go on cleanly; any other local change aborts the whole setup
+    rather than risk clobbering someone's manual edits to the toolkit.
+    """
     try:
         base = (PROJ / "toolkit" / "BASE_COMMIT").read_text().strip()
     except OSError:
@@ -101,10 +155,12 @@ def step_toolkit():
 
 # The patch last applied, kept inside xboxrecomp/.git (not part of the tree).
 def applied_copy():
+    """Path of the saved copy of the last-applied patch (inside .git, untracked)."""
     return TOOLKIT / ".git" / "hitz-applied.patch"
 
 
 def remember_patch():
+    """Copy PATCH to applied_copy() so a later run can detect/undo this version."""
     try:
         shutil.copyfile(PATCH, applied_copy())
     except OSError:
@@ -160,7 +216,17 @@ PARTITIONS = (0, 0x18300000, 0xFD90000, 0x2080000)
 
 
 def extract_iso(iso, dest):
-    """Extract an XDVDFS (Xbox disc) image. No external tools needed."""
+    """Extract an XDVDFS (Xbox disc) image. No external tools needed.
+
+    Scans PARTITIONS for the XDVDFS magic at sector 32 of each candidate
+    offset, to support both a trimmed xiso (game data starts at byte 0) and
+    a full redump dump (game partition starts further in, depending on the
+    disc generation). Once the volume is found, walks its directory tree
+    (an in-place binary tree per directory, 4-byte sector units) and copies
+    every file into dest, which the caller is expected to already have
+    prepared as scratch space. Calls die() on a missing volume or a
+    truncated file; prints progress every 50 files.
+    """
     with open(iso, "rb") as f:
         base = None
         for off in PARTITIONS:
@@ -174,10 +240,12 @@ def extract_iso(iso, dest):
         count = [0, 0]
 
         def read_at(sector, size):
+            """Read size bytes at the given XDVDFS sector, relative to base."""
             f.seek(base + sector * SECTOR)
             return f.read(size)
 
         def walk_dir(sector, size, path):
+            """Recursively extract one XDVDFS directory (its binary-tree table) into path."""
             if size == 0:
                 return
             data = read_at(sector, size)
@@ -223,6 +291,13 @@ def extract_iso(iso, dest):
 
 
 def xbe_title_id(xbe):
+    """Read the title id out of an Xbox executable's certificate header.
+
+    Returns the 32-bit title id, or None if the file is not an XBE ("XBEH"
+    magic) or is too short/unreadable to parse. Offsets 0x104 and 0x118 are
+    the XBE header's base address and certificate-address fields; the
+    certificate's title id is 8 bytes into the certificate.
+    """
     try:
         with open(xbe, "rb") as f:
             hdr = f.read(0x180)
@@ -237,6 +312,7 @@ def xbe_title_id(xbe):
 
 
 def check_title(xbe):
+    """Call die() unless xbe's title id matches TITLE_ID (NHL Hitz Pro USA); else return it."""
     tid = xbe_title_id(xbe)
     if tid != TITLE_ID:
         die("%s is not NHL Hitz Pro USA (title id %s, want 0x%08X)"
@@ -252,6 +328,15 @@ def replace_game(new_dir):
 
 
 def step_game(iso, game_dir):
+    """Step 2: populate hitz_pro/game from --iso or --game, or leave it alone if already set up.
+
+    Extraction/copy happens into a sibling "game.partial" directory first;
+    only once check_title() has confirmed the result is the right game does
+    replace_game() swap it in for the real "game" directory. That way a bad
+    disc image or an interrupted extraction never destroys a working
+    hitz_pro/game. Calls die() if neither --iso/--game was given and no game
+    is present yet, or if the title id check fails.
+    """
     say("Game files -> hitz_pro/game")
     xbe = GAME / "default.xbe"
     if xbe.exists() and not iso and not game_dir:
@@ -289,6 +374,7 @@ def step_game(iso, game_dir):
 
 # ---------------------------------------------------------------- 3. generate
 def file_hash(*paths):
+    """sha256 over the concatenated bytes of paths; used as the regeneration cache key."""
     h = hashlib.sha256()
     for p in paths:
         h.update(Path(p).read_bytes())
@@ -296,6 +382,21 @@ def file_hash(*paths):
 
 
 def step_generate(force):
+    """Step 4 (numbered 3 in the step comments): run the toolkit's code generation pipeline.
+
+    Runs, in order inside TOOLKIT: xbe_parser (static analysis to JSON),
+    disasm (full disassembly, including the XDK library sections -- never
+    pass --text-only or about 3000 functions go missing), func_id, then
+    abi_analysis, then recomp itself, which lifts x86 to C into GEN and
+    skips any function overridden in recomp_manual.c (--exclude-manual),
+    renaming the original to "..._gen" so the override can still call it.
+    Skipped entirely if GEN/.setup_stamp already matches file_hash() of the
+    game xbe, the toolkit PATCH and recomp_manual.c, and recomp_funcs.h
+    exists, unless force (--regen) is set. On success, writes the new hash
+    to the stamp file so the next run can skip again. Calls die() if
+    capstone is not importable, or if recomp produced fewer than 50 C files
+    or no recomp_funcs.h (a sign something upstream failed silently).
+    """
     say("Generate C code (parse XBE, disasm, classify, ABI, lift)")
     try:
         import capstone  # noqa: F401
@@ -336,6 +437,14 @@ def step_generate(force):
 
 # ---------------------------------------------------------------- 4. build
 def step_build():
+    """Step 5: run hitz_pro/build_windows.bat (MSVC/CMake/Ninja) via cmd.exe.
+
+    No-op (returns False) on non-Windows hosts: the build needs Visual
+    Studio, so Linux/macOS runs are expected to stop here and be finished on
+    a Windows machine, where rerunning setup.bat skips the already-done
+    steps. Calls die() with build-tools/locked-exe hints if the batch file
+    exits non-zero. Returns True if the build actually ran and succeeded.
+    """
     say("Build hitz_pro_recomp.exe (MSVC)")
     if not IS_WIN:
         print("  skipped: building needs Windows + Visual Studio.\n"
@@ -352,7 +461,16 @@ def step_build():
 
 
 def step_extras():
-    """SDL2.dll next to the exe, and the launcher in hitz_pro/."""
+    """SDL2.dll next to the exe, and the launcher in hitz_pro/.
+
+    Downloads the pinned SDL2 Windows DLL (needed for non-Xbox controllers;
+    XInput pads work without it) into .tools/ the first time, verifying its
+    sha256 against SDL2_SHA256 before trusting it, then unzips just
+    SDL2.dll next to the built exe. Failure here is not fatal to setup: it
+    prints a warning and leaves the game playable with XInput pads only.
+    Also copies the built launcher exe to hitz_pro/HitzLauncher.exe so
+    players have a stable, discoverable entry point.
+    """
     import io
     import urllib.request
     import zipfile
@@ -391,6 +509,7 @@ def step_extras():
 
 
 def main():
+    """Parse argv, then run the six steps in order (see the module docstring)."""
     ap = argparse.ArgumentParser(description="Set up, patch, generate and build the NHL Hitz Pro recomp.")
     ap.add_argument("--iso", help="NHL Hitz Pro (USA) disc image (.iso, xiso or full redump)")
     ap.add_argument("--game", help="folder with already-extracted game files (default.xbe ...)")

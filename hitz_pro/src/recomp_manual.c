@@ -16,6 +16,17 @@
  *   - Stub out a function that crashes (return early, set eax to a safe value)
  *   - Redirect a function to a native implementation (e.g., skip CRT init)
  *   - Intercept D3D/audio calls for custom rendering or sound
+ *
+ * Environment variables read in this file: HITZ_DIAG (gates every DIAG
+ * wrapper above), HITZ_SYNC_LOAD, HITZ_NO_DEFER, HITZ_KICK_WAIT,
+ * RECOMP_UNIMPL_TRAP. Each is documented at its own wrapper/function above.
+ *
+ * Threading model: every function here runs on whichever guest thread calls
+ * the Xbox address it overrides or wraps (the game's main/render thread for
+ * most of these; hitz_gpu_swmethod runs on the NV2A pushbuffer executor
+ * thread instead, since it is a software-method callback, not a guest call).
+ * The deferred pack-load completion queues (s_defer_q and friends) are
+ * __declspec(thread): each guest thread that touches packs has its own.
  */
 
 #include <stdio.h>
@@ -74,6 +85,14 @@ extern ptrdiff_t g_xbox_mem_offset;
  * wait sleeps on it (KeWaitForSingleObject loop at 0x254150). Without it that
  * wait never ends. Registered from main.c. */
 extern int xbox_SignalGuestEvent(uint32_t guest_va);
+/* Software-method callback registered with the NV2A pushbuffer executor
+ * (nv2a_pb_set_swmethod_callback, from main.c). Runs on the executor thread
+ * when it reaches a NO_OPERATION method with a non-zero parameter. Only
+ * parameter 5 (D3D's fence-wait notify) does anything: it reads the current
+ * D3D device pointer and signals the KEVENT at device+0x1DBC, waking the
+ * guest's fence wait. Logs (rate-limited to 4 lines) if the event address is
+ * not a KEVENT xbox_SignalGuestEvent recognises, which would mean D3D's
+ * device layout assumption above is wrong. */
 void hitz_gpu_swmethod(uint32_t param)
 {
     static int unknown;
@@ -87,6 +106,14 @@ void hitz_gpu_swmethod(uint32_t param)
 extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 extern void sub_00254000_gen(void);
 
+/* Override of the game's D3D fence wait at 0x00254000 (D3D_BlockOnTime,
+ * compares device+0x2C with *device+0x30). Before running the original body,
+ * reads the GPU-write-back semaphore address out of the live device
+ * structure (it can change across a device reset) and, the first time it
+ * changes, hands it to the pushbuffer executor via
+ * nv2a_pb_set_semaphore_target() and logs it. Without this the executor has
+ * nowhere to write its semaphore releases and the fence wait never
+ * completes. Runs on the game's D3D/render thread. */
 void sub_00254000(void)
 {
     static uint32_t s_sem;
@@ -124,11 +151,23 @@ static int hitz_diag_on(void)
 extern __declspec(thread) uint32_t g_ecx, g_esp;
 extern void sub_00015C60_gen(void);
 #define DIAG_M32(a) (*(volatile uint32_t *)(g_xbox_mem_offset + (uint32_t)(a)))
+/* True if p looks like a valid guest pointer: inside the mapped XBE/heap
+ * range (0x10000..0x4000000) or the high "cached" alias of it
+ * (0x80000000..0x84000000). Used only to decide whether a diagnostic dump is
+ * safe to dereference, not as a general validity check. */
 static int diag_ptr_ok(uint32_t p)
 {
     return (p >= 0x00010000u && p < 0x04000000u) ||
            (p >= 0x80000000u && p < 0x84000000u);
 }
+/* Diagnostic wrapper (HITZ_DIAG=1 only) for the mesh draw validator at
+ * 0x00015C60 (this = ecx = mesh). Before running the generated body, walks
+ * the mesh's materials ([+0x28] count, [+0x2C] array of 0x50-byte entries,
+ * each with [+0x48] strip count and [+0x4C] strip array of 12-byte entries)
+ * and, for the first 6 meshes whose data looks implausible (bad pointers,
+ * zero or huge counts), dumps raw header/material/strip words to stderr so
+ * the bad field can be traced back to its writer. Read-only: never modifies
+ * guest memory, only logs. Runs on whichever thread draws meshes. */
 void sub_00015C60(void)
 {
     if (!hitz_diag_on()) { sub_00015C60_gen(); return; }
@@ -172,6 +211,12 @@ void sub_00015C60(void)
 /* DIAG: sub_000142C0(prim, count, indices) -> D3D DrawIndexedVerticesUP.
  * Log the first calls with an implausible index pointer: caller + stack. */
 extern void sub_000142C0_gen(void);
+/* Diagnostic wrapper (HITZ_DIAG=1 only) around the D3D DrawIndexedVerticesUP
+ * call at 0x000142C0 (args on the guest stack: prim type, count, index
+ * pointer). Logs the first 4 calls whose index pointer fails diag_ptr_ok,
+ * with the call's stack arguments and 48 stack words, before letting the
+ * generated body run (which would otherwise read indices from a bad
+ * pointer, the crash this was added to diagnose). */
 void sub_000142C0(void)
 {
     if (!hitz_diag_on()) { sub_000142C0_gen(); return; }
@@ -194,6 +239,12 @@ void sub_000142C0(void)
  * edi = (*(u32*)0x36E924)[obj->[+8]] with obj = esi. Compare. */
 extern __declspec(thread) uint32_t g_esi, g_edi;
 extern void sub_00016140_gen(void);
+/* Diagnostic wrapper (HITZ_DIAG=1 only) for a mesh accessor at 0x00016140
+ * (this = ecx = mesh). Logs the first 6 calls where the mesh pointer looks
+ * like a code/rdata address (below 0x00357220, the start of .data) rather
+ * than a heap object, together with the caller's object pointer (esi) and
+ * what that object's lookup table entry ([0x36E924][obj+8]) resolves to, to
+ * compare against the mesh this function actually received. Read-only. */
 void sub_00016140(void)
 {
     if (!hitz_diag_on()) { sub_00016140_gen(); return; }
@@ -218,6 +269,11 @@ void sub_00016140(void)
 extern void sub_0015CE60_gen(void);
 extern void sub_0015DAE0_gen(void);
 
+/* Copies up to n-1 printable bytes of a NUL-terminated guest string at va
+ * into out as a C string, for safe inclusion in a log line; non-printable
+ * bytes become '?', and a bad pointer (diag_ptr_ok fails) yields an empty
+ * string instead of reading guest memory. Diagnostics-only helper, not used
+ * by the game logic. */
 static void diag_str(uint32_t va, char *out, int n)
 {
     int i;
@@ -228,6 +284,11 @@ static void diag_str(uint32_t va, char *out, int n)
     }
     out[i] = 0;
 }
+/* Diagnostic wrapper (HITZ_DIAG=1 only) for the pack registry's registration
+ * call at 0x0015DAE0 (this = registry at 0x584A94, args: name, alias). Logs
+ * every registration (name and alias as C strings) before running the
+ * generated body, to show what packs the title expects to be able to look
+ * up later. */
 void sub_0015DAE0(void)
 {
     if (!hitz_diag_on()) { sub_0015DAE0_gen(); return; }
@@ -239,6 +300,16 @@ void sub_0015DAE0(void)
             name, alias, g_ecx, DIAG_M32(g_esp));
     sub_0015DAE0_gen();
 }
+/* Diagnostic wrapper (HITZ_DIAG=1 only) for the pack registry's lookup call
+ * at 0x0015CE60 (this = registry, arg: name; 0 in eax = not found). Runs the
+ * generated body first (so eax holds the real result), then: logs lookup
+ * misses (rate-limited to the first 50); for the name "stadanimgeom"
+ * specifically, dumps the pack's raw header and its intrusive linked list of
+ * geometry objects on a hit, or walks the registry's hash-bucket node chain
+ * on a miss; and on a hit for any name seen for the first time, logs how
+ * full each of the pack's 11 intrusive lists is. All of this was added to
+ * trace why async pack loads came back empty (see the comment above
+ * sub_0015C2A0 below). */
 void sub_0015CE60(void)
 {
     if (!hitz_diag_on()) { sub_0015CE60_gen(); return; }
@@ -317,6 +388,12 @@ void sub_0015CE60(void)
  * before every pack load request (sub_0015DA40), forcing the synchronous
  * path. Tells a broken async loader from a broken parser. */
 extern void sub_0015DA40_gen(void);
+/* Override of the pack-load-request function at 0x0015DA40. When
+ * HITZ_SYNC_LOAD=1, clears the async-load flag byte at guest address
+ * 0x37B5CD before every call, forcing the title's synchronous load path
+ * instead of the asynchronous one; used (A/B) to tell a broken async loader
+ * from a broken parser. Off by default, in which case this is a pure
+ * pass-through to the generated body. */
 void sub_0015DA40(void)
 {
     static int s_sync = -1;
@@ -357,6 +434,9 @@ extern void sub_0015C3D0_gen(void);
 static __declspec(thread) int s_c2a0_depth;
 static __declspec(thread) uint32_t s_defer_q[128][2];
 static __declspec(thread) int s_defer_head, s_defer_tail;
+/* Reads HITZ_NO_DEFER once (cached) and logs whether deferred pack-load
+ * completions are enabled; returns true (deferral on, the default) unless
+ * HITZ_NO_DEFER=1. */
 static int defer_enabled(void)
 {
     static int en = -1;
@@ -367,6 +447,12 @@ static int defer_enabled(void)
     }
     return en;
 }
+/* Runs the generated pack-load completion body (0x0015C3D0) for one queued
+ * (a1, a2) entry, by hand-building the cdecl call frame it expects on the
+ * guest stack: push a2, push a1, push a dummy return address, call, then pop
+ * the two arguments back off after it returns (the body's own `ret` already
+ * consumed the dummy return slot). Called only from defer_leave(), on the
+ * thread that is draining the deferred queue. */
 static void run_completion(uint32_t a1, uint32_t a2)
 {
     /* cdecl call into the generated body: push a2, a1, dummy return. The
@@ -378,6 +464,12 @@ static void run_completion(uint32_t a1, uint32_t a2)
     sub_0015C3D0_gen();
     g_esp += 8;
 }
+/* Pairs with entering the outer pack-load call (0x0015C2A0 or 0x0002A4C0):
+ * decrements the thread-local nesting depth, and once it reaches 0 (the
+ * outermost call is returning) drains every completion queued while that
+ * call was in progress, in order, running each through run_completion().
+ * Draining a completion can itself queue more (re-entering the outer call
+ * for the next job), which the while loop picks up. */
 static void defer_leave(void)
 {
     s_c2a0_depth--;
@@ -389,6 +481,14 @@ static void defer_leave(void)
         }
     }
 }
+/* Override of the pack-open function at 0x0015C2A0 (opens a file, queues its
+ * read, and on the console would still be pending when this returns).
+ * Brackets the generated body with the deferral nesting counter, so any
+ * read completion that fires synchronously inside it (because the host's
+ * ReadFile completed before this call returned, unlike on a real DVD drive)
+ * is queued by sub_0015C3D0 instead of running immediately, and runs only
+ * once this (possibly nested) call fully unwinds. See the comment above
+ * the deferral machinery for why: without it, async packs came back empty. */
 void sub_0015C2A0(void)
 {
     s_c2a0_depth++;
@@ -408,6 +508,13 @@ void sub_0015C2A0(void)
  * returns, like the console's in-flight reads.
  */
 extern void sub_0002A4C0_gen(void);
+/* Override of the front-end/match-load message handler at 0x0002A4C0. Same
+ * deferral bracket as sub_0015C2A0, for the same reason: its loading states
+ * queue a batch of packs whose completions must not be allowed to drain the
+ * pending counter to 0 (and fire the "batch done" message) until every pack
+ * in the batch has actually been queued, as happens naturally on the
+ * console's own asynchronous DVD reads. A no-op pass-through when deferral
+ * is disabled (HITZ_NO_DEFER=1). */
 void sub_0002A4C0(void)
 {
     if (!defer_enabled()) { sub_0002A4C0_gen(); return; }
@@ -415,6 +522,14 @@ void sub_0002A4C0(void)
     sub_0002A4C0_gen();
     defer_leave();
 }
+/* Override of the pack-load completion callback at 0x0015C3D0(fileobj, job).
+ * While deferral is enabled and the calling thread is inside a bracketed
+ * outer call (s_c2a0_depth > 0), queues (a1, a2) into the thread-local ring
+ * s_defer_q instead of running the generated body now, mimicking the
+ * guest stack's `ret` (esp += 4) so the caller sees a normal return; falls
+ * back to running inline (with a warning) if the queue is full. Runs the
+ * generated body directly whenever deferral does not apply (disabled, or
+ * called from outside any bracketed outer call). */
 void sub_0015C3D0(void)
 {
     if (defer_enabled() && s_c2a0_depth > 0) {
@@ -433,6 +548,11 @@ void sub_0015C3D0(void)
 
 /* DIAG: pack parser sub_0015CDD0(this=registry, data, hdr). */
 extern void sub_0015CDD0_gen(void);
+/* Diagnostic wrapper (HITZ_DIAG=1 only) for the pack parser at 0x0015CDD0
+ * (this = registry, args: data buffer, header). Logs the first 60 calls
+ * with this/data/hdr and the first few words of each buffer, plus the
+ * calling thread id, before running the generated body; part of tracing why
+ * async-loaded pack data was seen as empty (data=8/hdr=0). */
 void sub_0015CDD0(void)
 {
     if (!hitz_diag_on()) { sub_0015CDD0_gen(); return; }
@@ -451,6 +571,12 @@ void sub_0015CDD0(void)
 /* DIAG: sub_0015C120 (async parse step, job in esi). */
 extern __declspec(thread) uint32_t g_ebx;
 extern void sub_0015C120_gen(void);
+/* Diagnostic wrapper (HITZ_DIAG=1 only) for the async pack parse step at
+ * 0x0015C120 (job pointer in esi). Logs the first 40 calls with the job's
+ * name string and its +0x218/+0x21C/+0x208 header fields (the buffer
+ * pointer, the 0xFFFFFFFF-marker-plus-size header, and a third field),
+ * which is the data the completion-ordering bug above (sub_0015C2A0) made
+ * arrive as zeroes. */
 void sub_0015C120(void)
 {
     if (!hitz_diag_on()) { sub_0015C120_gen(); return; }
@@ -469,6 +595,11 @@ void sub_0015C120(void)
 
 /* DIAG: game message post sub_000C7270(this, msg) and load-counter callback. */
 extern void sub_000C7270_gen(void);
+/* Diagnostic wrapper (HITZ_DIAG=1 only) for the game message post function
+ * at 0x000C7270 (this, msg). Logs only messages 0x116 (crowd pack done) and
+ * 0x117 (batch done -> load the crowd), with the pending-load counter at
+ * 0x3FCDFC and flag byte at 0x4E7654, rate-limited to the first 200; added
+ * to trace the crowd-loaded-20-times bug. */
 void sub_000C7270(void)
 {
     if (!hitz_diag_on()) { sub_000C7270_gen(); return; }
@@ -482,6 +613,11 @@ void sub_000C7270(void)
     sub_000C7270_gen();
 }
 extern void sub_00028A70_gen(void);
+/* Diagnostic wrapper (HITZ_DIAG=1 only) for the per-pack load-completion
+ * callback at 0x00028A70, which decrements the pending-batch counter at
+ * 0x3FCDFC. Logs the counter's value before and after the decrement
+ * (rate-limited to the first 400 calls), before running the generated body
+ * that actually decrements it. */
 void sub_00028A70(void)
 {
     if (!hitz_diag_on()) { sub_00028A70_gen(); return; }
@@ -495,6 +631,12 @@ void sub_00028A70(void)
 /* D3D KickOff: PFB flush completes at once (see src/recomp_kick.c). */
 extern void sub_00253E30_gen(void);
 extern void hitz_kick_impl(void);
+/* Override of D3D's KickOff at 0x00253E30. Normally runs hitz_kick_impl()
+ * (src/recomp_kick.c), the same logic with the PFB-flush wait replaced by an
+ * immediate completion; HITZ_KICK_WAIT=1 instead runs the untouched
+ * generated body, which spins until the executor thread clears the flush
+ * bit, for A/B comparison. The choice is read from the environment once and
+ * cached, with a one-line log of which path is active. */
 void sub_00253E30(void)
 {
     static int wait = -1;
@@ -663,6 +805,12 @@ void recomp_unimpl(const char *text, uint32_t va)
 #include "cheats.h"
 extern void sub_000999B0_gen(void);
 
+/* Override of the settings-block getter at 0x000999B0 (this = ecx). Runs
+ * the generated body first (eax = the returned settings block pointer),
+ * then, only when the receiver is the game's settings manager singleton
+ * (MEM32(0x4EB8E4)) and not some other caller of the same getter, applies
+ * the launcher's forced cheat values into that block via
+ * hitz_cheats_apply(). A no-op whenever no cheat is forced. */
 void sub_000999B0(void)
 {
     uint32_t self = g_ecx;

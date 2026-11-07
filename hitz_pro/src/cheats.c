@@ -23,12 +23,26 @@
 
 extern ptrdiff_t g_xbox_mem_offset;
 
+/* Guest-address accessors: g_xbox_mem_offset is added to a 32-bit Xbox
+ * virtual address to get the matching host pointer into the mapped guest
+ * memory (see xbox_memory_layout.c). volatile because the same guest word
+ * can be written by guest code running concurrently. */
 #define GUEST32(va) (*(volatile uint32_t *)(g_xbox_mem_offset + (uint32_t)(va)))
 #define GUESTF(va)  (*(volatile float *)(g_xbox_mem_offset + (uint32_t)(va)))
 
+/* Offset, within the current settings block, of the 32-bit unlock-bit mask
+ * (bit per cheat, see k_cheat[].unlock_bit). Guest address, not a byte count
+ * from this file's start. */
 #define SETTINGS_OFF_MASK 0x434u
+/* Guest address (bss) of the puck-size float the match setup reads to scale
+ * the puck model and its collision radius: scale = 1 + 0.15 * size. */
 #define PUCK_SIZE_FLOAT   0x4E79C8u
 
+/* One row per cheat, in cheats.h's HITZ_CHEAT_* order. env/name are for
+ * logging and parsing; off is the cheat's byte offset in the settings block;
+ * unlock_bit is its bit in the mask at SETTINGS_OFF_MASK; max is the highest
+ * valid stored value (0..max); values[] are the words parse() accepts for
+ * each stored value (puck size has no words, only numbers). */
 static const struct {
     const char *env;
     const char *name;
@@ -48,6 +62,7 @@ static int     s_init;
 static uint8_t s_v[HITZ_CHEAT_COUNT];
 static int     s_any;               /* any cheat forced: the fast path skips */
 
+/* Recomputes s_any from s_v[]; called after anything changes s_v[]. */
 static void recount(void)
 {
     int i;
@@ -56,6 +71,10 @@ static void recount(void)
         if (s_v[i] != HITZ_CHEAT_GAME) s_any = 1;
 }
 
+/* Turns one HITZ_CHEAT_* environment string into the stored byte value for
+ * cheat index i: a word match against k_cheat[i].values, a plain number
+ * within range, "game"/empty/unset for HITZ_CHEAT_GAME, or (with a warning
+ * to stderr) HITZ_CHEAT_GAME for anything else it cannot parse. */
 static uint8_t parse(int i, const char *e)
 {
     int j;
@@ -70,6 +89,9 @@ static uint8_t parse(int i, const char *e)
     return HITZ_CHEAT_GAME;
 }
 
+/* Reads every HITZ_CHEAT_* variable into s_v[] and logs the result if any
+ * cheat is forced. Idempotent: s_init makes every call after the first a
+ * no-op, so callers do not need to coordinate who calls it first. */
 void hitz_cheats_init(void)
 {
     int i;
@@ -80,12 +102,18 @@ void hitz_cheats_init(void)
     if (s_any) fprintf(stderr, "[CHEAT] %s\n", hitz_cheats_describe(s_v));
 }
 
+/* Copies the current cheat values out to the caller, parsing the environment
+ * first if that has not happened yet. */
 void hitz_cheats_get(uint8_t v[HITZ_CHEAT_COUNT])
 {
     hitz_cheats_init();
     memcpy(v, s_v, sizeof s_v);
 }
 
+/* Replaces the cheat values wholesale, e.g. with the host's values received
+ * over netplay. Out-of-range entries fall back to HITZ_CHEAT_GAME rather
+ * than being stored as-is. Marks the module initialised, so a later
+ * hitz_cheats_init()/_get() does not overwrite these with the environment. */
 void hitz_cheats_set(const uint8_t v[HITZ_CHEAT_COUNT])
 {
     int i;
@@ -95,6 +123,11 @@ void hitz_cheats_set(const uint8_t v[HITZ_CHEAT_COUNT])
     recount();
 }
 
+/* Formats the non-"game" entries of v as a short comma-separated line for
+ * logging, e.g. "player head big, puck glow red". Returns a pointer to a
+ * static buffer (not reentrant/thread-safe); returns "no cheats" if every
+ * entry is HITZ_CHEAT_GAME. Truncates silently if the buffer is too small
+ * for all five entries. */
 const char *hitz_cheats_describe(const uint8_t v[HITZ_CHEAT_COUNT])
 {
     static char buf[160];
@@ -112,6 +145,14 @@ const char *hitz_cheats_describe(const uint8_t v[HITZ_CHEAT_COUNT])
     return o ? buf : "no cheats";
 }
 
+/* Writes the forced cheat values (and their unlock bits) into the game's
+ * current settings block at guest address settings_va, and mirrors a forced
+ * puck size into the float the match setup reads for puck scale. A no-op if
+ * no cheat is forced (s_any) or if settings_va is outside the plausible
+ * guest address range (0x10000..0x4000000), which guards against being
+ * called before the settings block exists. Called from the settings getter
+ * override in recomp_manual.c, so this runs on the game thread, synchronously
+ * with whichever guest code just asked for its settings. */
 void hitz_cheats_apply(uint32_t settings_va)
 {
     int i;

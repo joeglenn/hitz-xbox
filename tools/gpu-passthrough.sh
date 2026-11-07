@@ -5,6 +5,15 @@
 #   sudo ~/hitz-xbox/tools/gpu-passthrough.sh status
 # While "on", the host has NO GPU: llama-router and ComfyUI are stopped.
 # If "off" fails to bring the GPU back (AMD iGPUs have no FLR), reboot odin; that always restores it.
+#
+# Machine-specific developer tool for the "odin" dev box: GPU=the Radeon
+# 8060S function, AUD=its HDMI audio function on the same card, both PCI
+# devices identified by their bus:device.function address. "on" moves both
+# from their normal driver (amdgpu / snd_hda_intel) to vfio-pci so a VM can
+# own the hardware directly; "off" reverses that. All actions run as root
+# (sudo) because they poke /sys/bus/pci driver-binding files. Every run
+# appends a timestamped log line to $OUT/passthrough.log via the `tee`
+# redirect near the top, in addition to whatever is printed to the terminal.
 set -u
 GPU=0000:bc:00.0
 AUD=0000:bc:00.1
@@ -17,9 +26,16 @@ echo "=== $(date -Is) $0 ${1:-}"
 
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 
+# drv ADDR: kernel driver currently bound to PCI device ADDR, or "none".
 drv() { basename "$(readlink -f /sys/bus/pci/devices/$1/driver 2>/dev/null)" 2>/dev/null || echo none; }
+# grp ADDR: the IOMMU group number ADDR belongs to (used to find /dev/vfio/<group>).
 grp() { basename "$(readlink -f /sys/bus/pci/devices/$1/iommu_group)"; }
 
+# Pull the GPU's video BIOS image out of the firmware's ACPI VFCT table and
+# save it to $OUT/vbios_1586.rom, so it can later be handed to the guest
+# (see tools/win11-gpu.sh and tools/mk_vfct.py). Needed because the Strix
+# Halo APU has no discrete VBIOS ROM to read directly; the ACPI VFCT table
+# (set up by firmware at boot) is the only place to get it from on the host.
 dump_vbios() {
     python3 - "$OUT/vbios_1586.rom" <<'EOF'
 import struct, sys
@@ -50,6 +66,9 @@ on)
     dump_vbios || { echo "VBIOS dump failed"; exit 1; }
     chown $OWNER: "$OUT/vbios_1586.rom"
     modprobe vfio-pci
+    # Detach any virtual console and the EFI framebuffer so the kernel stops
+    # touching the display before the GPU's PCI driver is unbound: otherwise
+    # the unbind can hang or the console can corrupt the screen.
     for vc in /sys/class/vtconsole/vtcon*/bind; do echo 0 > "$vc" 2>/dev/null || true; done
     echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind 2>/dev/null || true
     for d in $AUD $GPU; do

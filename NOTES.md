@@ -411,3 +411,11 @@ The launcher's Diagnostics box is now **Debug logging** (`debug` in hitz_setting
 - Launcher: `src/launcher/launcher_cheats.c`, a Cheats window opened from a button created left of Play (no layout code per edition), ini keys `cheat_*`.
 - Netplay: player 1's KEYOK carries 8 option bytes (its cheats); player 2 waits for them and plays with them. HELLOs could not carry them: the relay pairs players without HELLOs (first attempt desynced at frame 120 with the joiner on "no cheats").
 - Tests: attract demo with cheats (huge heads on every player, big red-glowing puck) vs without; relay and direct matches with cheats on the host only: no desync, 60 fps.
+
+## 2026-11-07: code documentation pass
+
+- Every project source file, script and the toolkit patch's own code were documented: file headers, a comment on every function, the reasons behind non-obvious code. Comments only.
+- Checked mechanically, per edition, against the code before the pass: C compared token by token after the compiler's own comment stripping (`gcc -fpreprocessed -dD -E -P`), Python by syntax tree without docstrings, scripts with comment lines removed; the recompiler's scan of `recomp_manual.c` must give the same sets; added text ASCII only. Regenerated toolkit patches give the same code once applied.
+- `recomp_manual.c` comments name game functions by address only (the recompiler reads `sub_XXXXXXXX` names in comments).
+- The anchor scripts in tools/hd were written against the sources before this pass; re-running apply_hd.sh from scratch may need their anchors updated where a comment now sits inside one.
+- Oddities noticed while documenting (not changed): `nv2a_pb_scan.c` compares `RECOMP_GPU_REPORT`'s first character with the number 1 rather than '1', so the report never switches on; the renderer's GPU draw queue needs D3D 11.1 constant-buffer offsets and has no fallback; the launcher's Cheats button finds Play by the literal id 1014; `hm_init` sets the movie thread's priority twice.

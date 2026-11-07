@@ -16,6 +16,9 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Common definitions
+# WIN32_LEAN_AND_MEAN: trims windows.h (fewer macro collisions across the many
+# toolkit/game translation units). NOMINMAX: windows.h's min/max macros would
+# otherwise shadow calls like std::min or a plain min() in game code.
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
     NOMINMAX
@@ -72,6 +75,10 @@ add_executable(${PROJECT_NAME} WIN32
     ${RECOMP_GEN_SOURCES}
 )
 
+# WIN32 above builds a GUI subsystem exe (WinMain, no console window); main()
+# in main.c is kept only for a console-subsystem debug build, if one is ever
+# configured separately.
+
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
@@ -122,6 +129,11 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 # MSVC-specific: large address aware, increase section limit for big generated files
+# /LARGEADDRESSAWARE: the recompiled game's own address space plus the host
+# allocations needs more than a default 2 GB 32-bit-style limit would imply on
+# some loaders; harmless on a 64-bit exe but documents the intent. /MAP:
+# produces hitz_pro_recomp.map, which tools/rva2sym.py and the crash handler
+# use to turn a faulting RVA back into a function name.
 if(MSVC)
     target_link_options(${PROJECT_NAME} PRIVATE
         /LARGEADDRESSAWARE

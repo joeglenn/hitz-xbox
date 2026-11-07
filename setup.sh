@@ -2,6 +2,13 @@
 # NHL Hitz Pro recomp: one-step setup (patch, extract, generate). Building needs Windows.
 #   ./setup.sh --iso "/path/NHL Hitz Pro (USA).iso"
 #   ./setup.sh --help
+#
+# Thin wrapper around setup.py: Windows gets its Python from uv (setup.bat),
+# this script instead makes (or reuses) a local venv in .tools/venv, installs
+# capstone into it if missing, then execs setup.py with that interpreter so
+# the real work in setup.py always runs under Python 3 with capstone present.
+# Exits 1 itself only if the venv cannot be created; otherwise setup.py's own
+# exit status is returned (exec replaces this shell with the python process).
 set -e
 cd "$(dirname "$0")"
 VENV=.tools/venv

@@ -1,3 +1,5 @@
 xboxrecomp-hitz.patch: the toolkit changes this project needs, against the xboxrecomp commit in BASE_COMMIT.
+The changed code is commented in the patch; README.md ("Reading the code") summarises what each part changes.
+setup.py applies it; to apply it by hand: cd ../xboxrecomp && git checkout <BASE_COMMIT> && git apply ../hitz_pro/toolkit/xboxrecomp-hitz.patch
 src/recomp/gen/ is not tracked: regenerate it with
   cd ../xboxrecomp && python -m tools.recomp ../game/default.xbe --all --split 250 --gen-dir ../hitz_pro/src/recomp/gen --exclude-manual ../hitz_pro/src/recomp_manual.c

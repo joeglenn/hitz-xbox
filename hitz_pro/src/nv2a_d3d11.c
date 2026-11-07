@@ -15,6 +15,70 @@
  * adapter with the most dedicated video memory, i.e. the discrete GPU on a
  * laptop with two). HITZ_GPU_CULL=1 enables hardware culling (the CPU path does
  * not cull). Stats every 10 s as [D3D11].
+ *
+ * How it is wired in: hitz_gpu_backend_init() (bottom of the file) calls
+ * nv2a_backend_register() with the clear/flip/draw_x/draw_vsh callbacks
+ * defined here (see nv2a_backend.h for the contract). Every callback runs on
+ * the NV2A poll thread, one at a time, never re-entered, so all the state
+ * below (devices, caches, the draw queue) needs no locking against the game
+ * threads. Two exceptions run off that thread: ps_worker() is a background
+ * shader-compiler thread, and the state it touches (the s_psc table and the
+ * shader-cache file) is covered by s_psc_cs/s_psc_cv.
+ *
+ * Key concepts:
+ *  - draw_x gives whole triangles already in surface pixels, with both vertex
+ *    colours, fog factor and four texture coordinate sets (Nv2aXVertex), plus
+ *    the four texture stages and the NV2A register-combiner state
+ *    (Nv2aCombiner, in nv2a_combiner.h via nv2a_backend.h). The pixel shader
+ *    s_hlsl's ps_main is a literal port of the executor's nv2a_rc_eval: it
+ *    walks the same combiner stages and the same final-combiner step, reading
+ *    and writing the same R0..R15 register file, so a title that only uses
+ *    stage 0 plus diffuse (no register combiners) takes the textured-modulate
+ *    shortcut near the bottom of ps_main instead.
+ *  - draw_vsh gives a vertex-program batch untransformed: raw attribute byte
+ *    ranges, a triangle-list index array and the 128-instruction NV2A vertex
+ *    program with its 192 float4 constants. vs_prog in s_hlsl is a port of
+ *    the executor's nv2a_vsh_interp.c instruction set (MAC/ILU ops, address
+ *    register, output write masks) so vertex transforms run on the GPU too;
+ *    the CPU keeps fixed-function and inline-array batches.
+ *  - Render targets (RT) and depth/stencil surfaces (DS) are GPU textures
+ *    keyed by the guest VRAM address the title wrote to them with
+ *    (KEY(), which folds the cached-vs-uncached VRAM alias away). A texture
+ *    whose key matches a recently drawn RT is bound as that RT's SRV instead
+ *    of being re-decoded (render-to-texture, e.g. pre-game load screens).
+ *  - A 2D texture cache (Tex, hashed by guest content so the same bytes are
+ *    not re-uploaded every frame) and small caches of D3D11 state objects
+ *    (blend/depth-stencil/sampler) avoid recreating GPU objects every draw.
+ *  - Draws are not issued immediately: they are recorded into a queue (QDraw)
+ *    over CPU-side windows of ring buffers (constants, vertices, raw vertex
+ *    attributes, indices) and replayed by qflush() with redundant state
+ *    changes filtered out, because the game issues roughly one D3D9-style
+ *    draw call per NV2A kick and the state rarely changes between them.
+ *  - Each distinct combiner/stage/alpha-test state also gets its own
+ *    specialised pixel shader (s_ps_spec_src, with K_* literals baked in by
+ *    ps_for()), compiled on a background thread and cached to
+ *    cache\hitz_shaders.bin, because the general ps_main (an indexable-temp
+ *    uber-shader) is roughly 100x more instructions than a specialised one.
+ *
+ * Environment variables read here (all optional): HITZ_GPU (must be "1" to
+ * register this back end at all), HITZ_GPU_ADAPTER, HITZ_GPU_CULL,
+ * HITZ_GPU_VSH (0: vertex programs stay on the CPU), HITZ_GPU_UBER (1: force
+ * the general shader, skip specialisation), HITZ_GPU_ASYNC_SHADERS (0:
+ * compile specialised shaders on the render thread, blocking),
+ * HITZ_SHADER_CACHE (0: do not read or write cache\hitz_shaders.bin),
+ * HITZ_GPU_FASTDECODE (0: always use the toolkit's per-texel decoder),
+ * HITZ_GPU_BC (0: decode DXT1/3/5 on the CPU instead of handing the blocks
+ * to the GPU as BC1/2/3), HITZ_TEX_VERIFY (1: cross-check the fast texture
+ * decoder against the toolkit's decoder for the first few textures per
+ * format), HITZ_TEX_FMT_LOG (log formats that still take the CPU decode
+ * path), HITZ_GPU_SYNC_READBACK (1: wait for render-target readback at the
+ * flip that produced it, instead of one flip later), HITZ_GPU_READBACK_POLL
+ * (1: poll readback with DO_NOT_WAIT instead of blocking Map), HITZ_GPU_PROF
+ * (1: per-category GPU timestamp queries and pipeline statistics, printed as
+ * [D3D11-PROF]), HITZ_GPU_TRACE (1: dump every draw/clear of occasional light
+ * frames as [TRACE]), HITZ_GPU_FLATPS (1: replace the pixel shader with one
+ * that outputs the diffuse colour untouched, to separate geometry bugs from
+ * shading bugs).
  */
 #define COBJMACROS
 #ifndef WIN32_LEAN_AND_MEAN
@@ -41,10 +105,17 @@ static void psc_init(void);           /* the shader cache, defined below */
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
+/* Provided by the toolkit's memory emulation: host pointer = this offset plus
+ * a guest virtual address. */
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+/* Host pointer for a guest VRAM/RAM address. */
 #define GUEST(va) ((uint8_t *)(xbox_GetMemoryOffset() + (ptrdiff_t)(va)))
 #define KEY(va)   ((va) & 0x0FFFFFFFu)   /* 0x80xxxxxx and 0x00xxxxxx are the same RAM */
 
+/* The D3D11 device, its immediate context (and the 11.1 context used for
+ * constant-buffer offsetting), the two vertex shaders (fixed path / GPU vertex
+ * program path), the two pixel shaders (combiner uber-shader / flat debug
+ * shader) and the input layout matching Nv2aXVertex. */
 static ID3D11Device        *s_dev;
 static ID3D11DeviceContext *s_ctx;
 static ID3D11DeviceContext1 *s_ctx1;
@@ -54,11 +125,22 @@ static ID3D11InputLayout   *s_il;
 static ID3D11Buffer        *s_vb, *s_cb;
 static UINT                 s_vb_size, s_vb_pos;
 static ID3D11RasterizerState *s_rs[4];      /* [cull] screen-space; [2+cull] programs (depth clip on) */
-/* GPU vertex programs: raw attribute ring, index ring, constants, program. */
+/* GPU vertex-program ring buffers: raw attribute ring (interleaved guest
+ * vertex data, as ByteAddressBuffer VB), index ring, per-draw constants and
+ * the program words, all referenced by the vs_prog HLSL entry point. */
 static ID3D11Buffer *s_raw, *s_ib, *s_vcb, *s_vpb;
 static ID3D11ShaderResourceView *s_raw_srv;
 static UINT s_raw_size, s_raw_pos, s_ib_size, s_ib_pos;
 static uint32_t s_prog_hash;
+/* Mirrors HLSL cbuffer VC: per-draw vertex-program state.
+ * c: the 192 vertex-program float4 constants (NV097 constant memory).
+ * attr: per-attribute [raw-buffer byte offset, stride, NV097 type, component
+ *       count]; a zero stride+type+count means the attribute is constant and
+ *       aval[] holds its value instead of being fetched.
+ * aval: constant attribute value, used when attr[].w == 0.
+ * vm: [instruction count, fog enable, fog mode, unused].
+ * vmf: [fog param0, fog param1, aa_sx, aa_sy] (anti-aliasing scale applied to
+ *      oPos.xy, matching the executor's CPU vertex-program path). */
 typedef struct {
     float c[192][4];
     uint32_t attr[16][4];
@@ -67,8 +149,8 @@ typedef struct {
     float vmf[4];
 } VCData;
 static int s_failed, s_cull;
-static uint32_t s_frame = 1;
-volatile int g_hitz_heavy;
+static uint32_t s_frame = 1;         /* bumped once per flip; used for LRU ages */
+volatile int g_hitz_heavy;           /* this frame had > 1000 draws: profiler hint */
 
 /* ------------------------------------------------------------ statistics */
 static struct { unsigned long long draws, vsh_draws, tris, tex_up, tex_up_bytes, tex_bc, tex_fast, tex_ms_cpu, rt_reads, rt_alias, flips;
@@ -78,6 +160,10 @@ static unsigned long long s_frame_draw_ns;   /* draw building since the last rep
  * feed the log and the performance log: off without debug logging. */
 static int s_tm = 1;
 #define TNOW() (s_tm ? now_ns() : 0ull)
+/* Monotonic wall-clock time in nanoseconds (QueryPerformanceCounter scaled by
+ * QueryPerformanceFrequency, cached on first use). Returns 0 before the first
+ * call ever reaches QueryPerformanceFrequency only in the degenerate case of
+ * a zero-frequency counter, which Windows does not produce. */
 static unsigned long long now_ns(void)
 {
     static LARGE_INTEGER f;
@@ -88,6 +174,14 @@ static unsigned long long now_ns(void)
 }
 
 /* ------------------------------------------------------------ shaders */
+/* HLSL source compiled at runtime (D3DCompile, in init_device()). It defines
+ * vs_main (fixed-function-batch transform: NDC projection of pre-rasterised
+ * surface-pixel coordinates), ps_main (the combiner uber-shader, a literal
+ * port of the executor's nv2a_rc_eval; see the file header for the register
+ * model), ps_flat (HITZ_GPU_FLATPS debug shader) and vs_prog (the GPU vertex
+ * program interpreter, a port of nv2a_vsh_interp.c). Kept as a plain string:
+ * never edit this text with anything but HLSL syntax in mind, since changing
+ * it changes what ships to the GPU, not just documentation. */
 static const char s_hlsl[] =
 "cbuffer CB : register(b0) {\n"
 "  uint4 ICW[2]; uint4 AICW[2]; uint4 OCW[2]; uint4 AOCW[2]; uint4 F0[2]; uint4 F1[2];\n"
@@ -343,6 +437,14 @@ static const char s_hlsl[] =
 "}\n"
 ;
 
+/* The ps_spec entry point: the same combiner walk as ps_main, but reading the
+ * combiner/stage state from compile-time literals (K_N, K_FLAGS, K_ICW[]...)
+ * instead of the CB cbuffer, so the compiler folds dead stages and branches
+ * away. The literals are generated per distinct state by ps_for() and
+ * prepended before this source is compiled (see s_hlsl above for CB/ICW
+ * layout and the shared helper functions g8/unpack/map_in/map_out/rd_rgb/
+ * rd_a/tex2/texc, all defined in s_hlsl and still in scope when the two
+ * strings are concatenated). */
 static const char s_ps_spec_src[] =
 "/* ---- specialised pixel shader: K_* are literals prepended per combiner state ---- */\n"
 "float4 sample_k(uint st, float4 c, inout bool keep) {\n"
@@ -430,6 +532,22 @@ static const char s_ps_spec_src[] =
 "}\n"
 ;
 
+/* Mirrors HLSL cbuffer CB (register b0): per-draw combiner/stage/render
+ * state for both ps_main and the vertex shaders' RT values.
+ * icw/aicw: colour/alpha input combiner words per stage (A/B/C/D register
+ *           selectors and modifiers), ocw/aocw: output combiner words
+ *           (destination registers and the AB+CD/mux/clamp flags),
+ *           f0/f1: per-stage or shared factor-register colours (NV097
+ *           SET_COMBINER_FACTOR0/1).
+ * fin: [final0, final1] combiner words, [final_c0, final_c1] colours.
+ * ctl: [NV097 control word: stage count in bits 0-7, flags in bits 8+,
+ *      stage_program (5 bits per stage: texture mode NONE/2D/3D/cube/
+ *      passthru/clip-plane), use_rc, textured].
+ * misc: [fog colour, alpha_test_enable, alpha_func, alpha_ref].
+ * misc2: [clip_plane_mode bits, per stage, 4 bits each].
+ * rt: [render-target width, height, 1/zmax, unused] -- zmax is 65535 or
+ *     16777215 depending on the depth surface's bit depth.
+ * ts: per-stage [width, height, normalized flag, cube flag]. */
 typedef struct {
     uint32_t icw[8], aicw[8], ocw[8], aocw[8], f0[8], f1[8];
     uint32_t fin[4], ctl[4], misc[4], misc2[4];
@@ -438,6 +556,19 @@ typedef struct {
 } CBData;
 
 /* ------------------------------------------------------------ render targets */
+/* A colour surface's GPU copy, keyed by its guest VRAM address (KEY()).
+ * key/va: the KEY() and raw guest address of pixel (0,0).
+ * w/h/pitch/bpp/format/swizzled: as last created (SET_SURFACE_FORMAT/
+ *     SET_SURFACE_PITCH); swizzled means render-to-texture (Morton order),
+ *     with w/h the power-of-two swizzled size.
+ * tex/rtv/srv: the GPU texture and its render-target/shader-resource views.
+ * staging: a CPU-readable copy used for the flip readback (see be_flip()).
+ * dirty: drawn to since the last readback; pending: copied to staging, not
+ *     yet written to guest memory (one flip of asynchronous readback latency).
+ * sampled_frame: last frame this RT's SRV was bound as a texture (keeps it
+ *     off the readback path while something still reads it on the GPU).
+ * last_frame: last frame used for anything; drives the least-recently-used
+ *     eviction in rt_get(). */
 typedef struct {
     uint32_t key, va, w, h, pitch, bpp, format, swizzled;
     ID3D11Texture2D *tex, *staging;
@@ -450,6 +581,13 @@ typedef struct {
 #define MAX_RT 24
 static RT s_rt[MAX_RT];
 
+/* A depth/stencil surface, keyed like RT. tex/dsv are the real depth-stencil
+ * texture (R32G8X24_TYPELESS) and its view; dsrv/ssrv read it back as depth
+ * and stencil textures respectively (used by sampler shadow lookups and
+ * z_as_texture()). ztex/zrtv/zsrv are a second, separate texture that holds
+ * the depth in the Xbox's own encoding (packed into A8B8G8R8 by the z_init()
+ * shaders) for a title that samples its own depth buffer as a colour
+ * texture; zw/zh are that texture's current size. */
 typedef struct {
     uint32_t key, w, h;
     ID3D11Texture2D *tex;
@@ -461,6 +599,9 @@ typedef struct {
     ID3D11ShaderResourceView *zsrv;
     uint32_t zw, zh;
 } DS;
+/* Releases every GPU object in a DS slot and zeroes it; does not flush the
+ * draw queue itself (callers do that first if a pending draw could still
+ * reference the views being released). */
 static void ds_release(DS *d)
 {
     if (d->zsrv) ID3D11ShaderResourceView_Release(d->zsrv);
@@ -477,6 +618,9 @@ static DS s_ds[MAX_DS];
 
 static void qflush(void);
 static int s_q_ok;
+/* Releases an RT slot's GPU objects and zeroes it. Flushes the draw queue
+ * first if the queue is active, since a queued draw may still reference this
+ * RT's views (render target or sampled texture) before it is replayed. */
 static void rt_free(RT *r)
 {
     if (s_q_ok > 0) qflush();
@@ -487,6 +631,8 @@ static void rt_free(RT *r)
     memset(r, 0, sizeof *r);
 }
 
+/* Byte offset of texel (x, y) within a w x h swizzled (Morton-order) surface
+ * or texture level, in texels (the caller multiplies by bpp). */
 static uint32_t swz_offset(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
     /* Morton order as the NV2A swizzles: bits of x and y interleaved, x first,
@@ -499,6 +645,8 @@ static uint32_t swz_offset(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     return off;
 }
 
+/* RGB565 (NV2A's 16-bit colour format) -> 0xAARRGGBB, alpha opaque; channels
+ * expanded to 8 bits by replicating the top bits into the gap. */
 static uint32_t px565_to_argb(uint16_t p)
 {
     uint32_t r = (p >> 11) & 31, g = (p >> 5) & 63, b = p & 31;
@@ -523,6 +671,15 @@ static void rt_upload_guest(RT *r)
     free(buf);
 }
 
+/* The render target for surface s: an existing GPU texture reused if it is
+ * still big enough and the same shape (bpp, swizzled, pitch), otherwise a
+ * freshly created one (uploaded once from guest memory, so a target the
+ * title or the CPU path already drew into keeps its contents) replacing the
+ * same key's old texture or, failing that, the least-recently-used slot.
+ * width/height for a linear surface come from the pitch and the clip
+ * rectangle (not from the surface's own width/height, which can be smaller
+ * than what was actually written, e.g. scissored clears). NULL if the shape
+ * is degenerate (0 or > 4096 either way) or texture creation fails. */
 static RT *rt_get(const Nv2aSurface *s)
 {
     uint32_t key = KEY(s->color_va), w, h;
@@ -575,6 +732,8 @@ static RT *rt_get(const Nv2aSurface *s)
     }
 }
 
+/* The RT currently holding the surface at this key, or NULL: used by the
+ * texture cache to detect render-to-texture before decoding guest memory. */
 static RT *rt_find_key(uint32_t key)
 {
     int i;
@@ -584,6 +743,13 @@ static RT *rt_find_key(uint32_t key)
     return NULL;
 }
 
+/* The depth/stencil surface for zeta_va, at least w x h: an existing slot if
+ * it is already big enough, otherwise that slot (or an empty one, or slot 0
+ * as a last resort) rebuilt at the larger of the requested size and a
+ * 1280x1024 floor (so a later, bigger request for the same key does not
+ * thrash). Always D32_FLOAT_S8X24, with read-only depth and stencil SRVs.
+ * A freshly created surface is cleared to 1.0/0 depth/stencil. NULL only if
+ * texture creation fails. */
 static DS *ds_get(uint32_t zeta_va, uint32_t w, uint32_t h)
 {
     uint32_t key = KEY(zeta_va);
@@ -630,6 +796,15 @@ static DS *ds_get(uint32_t zeta_va, uint32_t w, uint32_t h)
 }
 
 /* ------------------------------------------------------------ textures */
+/* A sampled 2D/cube texture uploaded from guest memory, keyed by guest
+ * address plus the parameters that change its layout, so two textures at the
+ * same address with a different size/format/palette do not collide.
+ * color: NV097 colour-format code; cube/palette: as the title set them.
+ * bytes: guest bytes read for the content hash (all faces/levels sampled).
+ * hash: FNV-1a over those bytes (plus the palette, if any); hashed_frame:
+ *     the frame it was last computed on, so a texture already checked this
+ *     frame is not re-hashed on every draw that samples it.
+ * last_frame: last frame used; drives least-recently-used eviction. */
 typedef struct {
     uint32_t key, w, h, color, pitch, cube, palette, bytes;
     uint64_t hash;
@@ -643,7 +818,9 @@ static Tex s_tex[MAX_TEX];
 #define TEX_BUCKETS 4096
 static uint16_t s_tex_head[TEX_BUCKETS], s_tex_next[MAX_TEX];
 static uint32_t s_tex_used, s_tex_hint;
+/* Hash bucket for a texture key (top 12 bits of a Knuth multiplicative hash). */
 static uint32_t tex_bucket(uint32_t key) { return (key * 2654435761u) >> 20; }
+/* Inserts slot i's texture (already filled in) at the head of its bucket chain. */
 static void tex_link(uint32_t i)
 {
     uint32_t b = tex_bucket(s_tex[i].key);
@@ -651,6 +828,9 @@ static void tex_link(uint32_t i)
     s_tex_head[b] = (uint16_t)(i + 1);
     s_tex_used++;
 }
+/* Releases slot i's GPU objects, unlinks it from its bucket chain and zeroes
+ * it. Flushes the draw queue first (a queued draw may still sample this
+ * texture's SRV). */
 static void tex_drop(uint32_t i)                 /* release and unlink */
 {
     if (s_q_ok > 0) qflush();
@@ -776,6 +956,11 @@ static ID3D11VertexShader *s_z_vs;
 static ID3D11PixelShader *s_z_ps;
 static int s_z_ok;               /* 0 untried, 1 ready, -1 unavailable */
 static unsigned s_z_reads;
+/* A full-screen pass that packs a D32_FLOAT_S8X24 depth/stencil surface into
+ * 0xAARRGGBB the way the Xbox stores a 24-bit depth buffer (Z scaled to
+ * 0..16777215, stencil in alpha), so a title that samples its own depth
+ * buffer as an ordinary colour texture sees the bytes it expects instead of
+ * a normalized float. Used by z_as_texture() below. */
 static const char s_z_hlsl[] =
     "Texture2D<float> dz : register(t0);\n"
     "Texture2D<uint2> st : register(t1);\n"
@@ -790,6 +975,9 @@ static const char s_z_hlsl[] =
     "  return float4(s8, z & 255, (z >> 8) & 255, z >> 16) / 255.0;\n"
     "}\n";
 
+/* Compiles and caches the depth-readback shaders (s_z_hlsl) on first use.
+ * Returns true once they are ready; caches failure too (does not retry every
+ * call) so a shader-compile problem is reported once, not every draw. */
 static int z_init(void)
 {
     ID3DBlob *b = NULL;
@@ -862,6 +1050,15 @@ static ID3D11ShaderResourceView *z_as_texture(const Nv2aStage *t)
     return d->zsrv;
 }
 
+/* Shader-resource view to sample texture stage t: in priority order, the
+ * depth buffer at this address read back as a colour texture (z_as_texture),
+ * a render target recently drawn at this address (render-to-texture), a
+ * matching entry already in the texture cache (re-hashing guest memory at
+ * most once per frame to catch content changes), or a freshly uploaded GPU
+ * texture (DXT1/3/5 handed to the GPU as BC1/2/3 blocks when possible,
+ * otherwise decoded to ARGB on the CPU; see fast_decode()). *is_cube reports
+ * whether the result is a cube map. Evicts the least-recently-used cache
+ * slot when the cache is full. NULL if nothing could be produced. */
 static ID3D11ShaderResourceView *tex_get(int st, const Nv2aStage *t, int *is_cube)
 {
     uint32_t key = KEY(t->offset), i, h, slot = MAX_TEX, lru = 0;
@@ -1047,6 +1244,8 @@ static D3D11_BLEND blend_f(uint32_t f, int alpha)
     default: return f ? D3D11_BLEND_ONE : D3D11_BLEND_ZERO;
     }
 }
+/* NV2A blend equation (SET_BLEND_EQUATION, OpenGL GL_FUNC_* encoding) ->
+ * D3D11 blend op; default is ADD. */
 static D3D11_BLEND_OP blend_op(uint32_t e)
 {
     switch (e) {
@@ -1057,6 +1256,9 @@ static D3D11_BLEND_OP blend_op(uint32_t e)
     default: return D3D11_BLEND_OP_ADD;
     }
 }
+/* NV2A compare function (GL_NEVER 0x200 .. GL_ALWAYS 0x207) -> D3D11
+ * comparison func; default (an unrecognised value) is ALWAYS. Used for both
+ * depth and stencil compares. */
 static D3D11_COMPARISON_FUNC cmp_f(uint32_t f)
 {
     switch (f) {
@@ -1070,6 +1272,8 @@ static D3D11_COMPARISON_FUNC cmp_f(uint32_t f)
     default:    return D3D11_COMPARISON_ALWAYS;
     }
 }
+/* NV2A stencil op (GL_KEEP/GL_ZERO/GL_REPLACE/GL_INCR.._DECR../GL_INVERT, see
+ * Nv2aRenderState in nv2a_backend.h) -> D3D11 stencil op; default is KEEP. */
 static D3D11_STENCIL_OP st_op(uint32_t o)
 {
     switch (o) {
@@ -1084,9 +1288,16 @@ static D3D11_STENCIL_OP st_op(uint32_t o)
     }
 }
 
+/* A small open-addressed cache of D3D11 state objects, keyed by a hash of
+ * the render state that produced them, so a repeated state reuses the same
+ * COM object instead of asking the driver to create one every draw. Never
+ * evicts: CACHE_N (512) is assumed to exceed the number of distinct blend/
+ * depth-stencil/sampler states a title actually uses. */
 typedef struct { uint64_t key; void *obj; } Cache;
 #define CACHE_N 512
 static Cache s_bs[CACHE_N], s_dss[CACHE_N], s_ss[CACHE_N];
+/* Linear-probed lookup starting at a hash of key. NULL on a miss (including
+ * a full table, where the probe wraps back to its start). */
 static void *cache_find(Cache *c, uint64_t key)
 {
     uint32_t i = (uint32_t)(key * 0x9E3779B97F4A7C15ull >> 55) & (CACHE_N - 1), n;
@@ -1096,6 +1307,8 @@ static void *cache_find(Cache *c, uint64_t key)
     }
     return NULL;
 }
+/* Inserts obj at the first free slot found by the same probe as cache_find;
+ * silently does nothing if the table is full. */
 static void cache_put(Cache *c, uint64_t key, void *obj)
 {
     uint32_t i = (uint32_t)(key * 0x9E3779B97F4A7C15ull >> 55) & (CACHE_N - 1), n;
@@ -1103,6 +1316,9 @@ static void cache_put(Cache *c, uint64_t key, void *obj)
         if (!c[i].obj) { c[i].key = key; c[i].obj = obj; return; }
 }
 
+/* Cached ID3D11BlendState for render state r's blend fields (enable, src/dst
+ * factors, equation -- same for colour and alpha -- and the colour write
+ * mask); created and cached on first use. NULL if creation fails. */
 static ID3D11BlendState *blend_state(const Nv2aRenderState *r)
 {
     uint64_t key = ((uint64_t)r->blend_enable << 63) | ((uint64_t)(r->blend_src & 0xFFFF) << 40)
@@ -1130,6 +1346,11 @@ static ID3D11BlendState *blend_state(const Nv2aRenderState *r)
     return bs;
 }
 
+/* Cached ID3D11DepthStencilState for render state r's depth/stencil fields.
+ * have_ds disables depth/stencil testing and writes when the batch has no
+ * depth surface bound, regardless of what the title asked for (there is
+ * nothing to test against or write to). Front and back stencil faces are
+ * set identically (NV2A has no separate back-face stencil op). */
 static ID3D11DepthStencilState *depth_state(const Nv2aRenderState *r, int have_ds)
 {
     uint64_t key;
@@ -1161,6 +1382,8 @@ static ID3D11DepthStencilState *depth_state(const Nv2aRenderState *r, int have_d
     return ds;
 }
 
+/* NV097 texture addressing mode (1 wrap, 2 mirror, 3 clamp, 4 border) -> D3D11
+ * address mode; default (1, or anything unrecognised) is WRAP. */
 static D3D11_TEXTURE_ADDRESS_MODE addr_m(uint32_t a)
 {
     switch (a) {
@@ -1171,6 +1394,11 @@ static D3D11_TEXTURE_ADDRESS_MODE addr_m(uint32_t a)
     }
 }
 
+/* Cached ID3D11SamplerState for stage t's filter and addressing: linear if
+ * either the magnification or minification filter code is one of the NV097
+ * linear variants (2, 4, 6; anisotropic filtering is not distinguished from
+ * linear), otherwise point. Border addressing without a border colour set
+ * degrades to clamp, matching the CPU path. */
 static ID3D11SamplerState *sampler(const Nv2aStage *t)
 {
     uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
@@ -1348,6 +1576,11 @@ static int init_device(void)
     return 1;
 }
 
+/* Lazily creates the D3D11 device and every long-lived GPU object the first
+ * time any callback runs; afterwards just reports the cached result. Logs
+ * once ("back end unavailable") on the first failed attempt; never retries,
+ * so a title that cannot get a D3D11 device runs with no GPU rendering at
+ * all rather than retrying every draw. */
 static int ready(void)
 {
     static int state;                 /* 0 untried, 1 ok, -1 failed */
@@ -1392,6 +1625,12 @@ static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
 /* HITZ_GPU_PROF=1: GPU time per draw category (timestamp pair per draw,
  * summed 3 frames later) and pipeline statistics per frame. Diagnostic only:
  * the queries themselves cost a little. */
+/* Per-draw GPU timestamp pairs for up to 4 frames in flight (N, N-1, N-2,
+ * N-3), indexed by s_gp_frame & 3: dj/ps are the frame's disjoint-timestamp
+ * and pipeline-statistics queries, t[] holds 2 timestamp queries per draw
+ * (begin, end), cat[] the draw's category (0 draw_x, 1 draw_vsh, 2 clear)
+ * and n how many draws were recorded this frame. px_hint is declared but not
+ * used anywhere in this file. */
 #define GP_MAX 8192
 typedef struct {
     ID3D11Query *dj, *ps, *t[GP_MAX * 2];
@@ -1403,11 +1642,15 @@ static GProfFrame s_gp[4];
 static int s_gp_on = -1, s_gp_frame;
 static double s_gp_cat_ms[3];             /* 0 draw_x, 1 draw_vsh, 2 clear */
 static unsigned long long s_gp_vs, s_gp_psi, s_gp_iav, s_gp_frames;
+/* Caches the HITZ_GPU_PROF=1 check (read once, since getenv is not free on
+ * the hot path). */
 static int gprof_on(void)
 {
     if (s_gp_on < 0) { const char *e = getenv("HITZ_GPU_PROF"); s_gp_on = e && *e == '1'; }
     return s_gp_on;
 }
+/* Opens a GPU timestamp query for one draw in category cat (see GProfFrame);
+ * a no-op unless gprof_on(). Silently drops draws past GP_MAX per frame. */
 static void gprof_begin_draw(int cat)
 {
     GProfFrame *f = &s_gp[s_gp_frame & 3];
@@ -1420,6 +1663,8 @@ static void gprof_begin_draw(int cat)
     f->cat[f->n] = (uint8_t)cat;
     ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)f->t[f->n * 2]);
 }
+/* Closes the timestamp query gprof_begin_draw() opened for the current draw
+ * and advances the frame's draw count. Must be paired with it. */
 static void gprof_end_draw(void)
 {
     GProfFrame *f = &s_gp[s_gp_frame & 3];
@@ -1468,6 +1713,10 @@ static void gprof_flip(void)
     ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)f->dj);
     ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)f->ps);
 }
+/* Prints [D3D11-PROF] per-frame GPU time by category and pipeline-statistics
+ * averages, then resets the accumulators; called from be_flip()'s 10 s
+ * summary. A no-op if gprof_on() is off or no frame's data has been
+ * collected yet. */
 static void gprof_report(void)
 {
     if (!gprof_on() || !s_gp_frames) return;
@@ -1515,6 +1764,8 @@ static uint64_t s_psc_src_hash;
 static struct { int slot; char *src; size_t len; } s_psq[PSQ];
 static unsigned s_psq_head, s_psq_tail;
 
+/* FNV-1a over n bytes starting from seed h (not always the standard offset
+ * basis, so callers can chain hashes of several buffers). */
 static uint64_t fnv(const void *p, size_t n, uint64_t h)
 {
     const uint8_t *b = (const uint8_t *)p;
@@ -1522,6 +1773,7 @@ static uint64_t fnv(const void *p, size_t n, uint64_t h)
     return h;
 }
 
+/* FNV-1a hash of a PsKey, used to find or insert its ps_slot(). */
 static uint64_t key_hash(const PsKey *k)
 {
     return fnv(k, sizeof *k, 0xcbf29ce484222325ull);
@@ -1542,6 +1794,10 @@ static int ps_slot(const PsKey *k, uint64_t h, int *found)
     return -1;
 }
 
+/* Appends one compiled shader (key + bytecode) to the on-disk cache file, so
+ * it survives to the next run. A no-op if HITZ_SHADER_CACHE=0 disabled the
+ * disk cache. Opens, writes and closes the file under s_psc_cs on every call
+ * (compiles are rare enough that this is not a bottleneck). */
 static void psc_append(const PsKey *k, const void *code, uint32_t len)
 {
     FILE *f;
@@ -1588,6 +1844,11 @@ static void ps_compile(int slot, const char *src, size_t len, int background)
     InterlockedExchange(&e->state, ps ? PS_READY : PS_FAILED);
 }
 
+/* Background shader-compiler thread body: sleeps on s_psc_cv until ps_for()
+ * queues a job, then compiles it with ps_compile(..., background=1) and
+ * frees the queued source copy. Runs for the life of the process (never
+ * returns); below-normal priority so it does not compete with the render
+ * thread. */
 static DWORD WINAPI ps_worker(LPVOID unused)
 {
     (void)unused;
@@ -1681,6 +1942,11 @@ fresh:
     xbox_PerfNote("shader cache: empty (new shaders are compiled in the background and kept)");
 }
 
+/* Sets up the specialised-shader cache: reads HITZ_GPU_ASYNC_SHADERS and
+ * HITZ_SHADER_CACHE, hashes the current shader source (so a shader-cache
+ * file built for different HLSL is rejected by psc_load() rather than
+ * loading bytecode for the wrong source), loads any existing disk cache and
+ * starts the background compiler thread. Called once from init_device(). */
 static void psc_init(void)
 {
     const char *e;
@@ -1700,6 +1966,15 @@ static void psc_init(void)
     }
 }
 
+/* The specialised pixel shader for combiner/stage/alpha-test state k: ready
+ * immediately if already compiled or loaded from the on-disk cache; NULL
+ * (meaning: use the general ps_main) while it is being compiled, queued for
+ * the background thread, or if it has failed. If this is a new state, emits
+ * its literal K_* declarations (see s_ps_spec_src) and either compiles it on
+ * the spot (HITZ_GPU_ASYNC_SHADERS=0) or hands it to ps_worker(). The
+ * literal source is built into a function-local static buffer (not
+ * reentrant: never called from more than one thread, which holds for the
+ * NV2A poll thread calling this). */
 static ID3D11PixelShader *ps_for(const PsKey *k)
 {
     uint64_t h = key_hash(k);
@@ -1768,6 +2043,10 @@ static ID3D11Buffer *s_cring;
 static UINT s_cring_size, s_cring_pos, s_cring_gen;
 static uint8_t *s_cring_map;
 static int s_cring_ok = -1;
+/* Checks for D3D11.1 constant-buffer-offsetting support and, if present,
+ * creates the constant-buffer ring (s_cring). Without that support q_init()
+ * (and so every draw) fails entirely: there is no per-draw-rename fallback
+ * path. Safe to call repeatedly: caches its result. */
 static int cring_init(void)
 {
     D3D11_BUFFER_DESC bd;
@@ -1815,6 +2094,10 @@ static int ring_setup(Ring *r, ID3D11Buffer *buf, UINT size, UINT cap)
     r->cpu = (uint8_t *)malloc(cap);
     return r->cpu != NULL;
 }
+/* Opens (reserves) r's current window if not already open: rewinds to the
+ * start of the ring if the next window would run past its end, and marks
+ * whether this window needs a WRITE_DISCARD (ring just rewound) or can use
+ * WRITE_NO_OVERWRITE (appending after the previous window). */
 static void ring_begin(Ring *r)
 {
     if (r->open) return;
@@ -1837,6 +2120,11 @@ static UINT ring_alloc(Ring *r, UINT n, UINT align)
     return r->base + at;
 }
 static uint8_t *ring_ptr(Ring *r, UINT abs_off) { return r->cpu + (abs_off - r->base); }
+/* Uploads r's recorded window to the GPU buffer (skipped if nothing was
+ * written) and closes it, advancing pos past this window (256-byte aligned)
+ * for the next ring_begin(). A failed Map silently drops the window's
+ * contents; the next draw using stale data would then read whatever the
+ * buffer already held there. */
 static void ring_upload(Ring *r)
 {
     D3D11_MAPPED_SUBRESOURCE m;
@@ -1889,6 +2177,16 @@ static int q_init(void)
     return 1;
 }
 
+/* Uploads every ring's recorded window, then issues the queued draws in
+ * order with D3D11 state changes applied only where they differ from the
+ * previous draw (render target/viewport/scissor/rasterizer/pixel shader/
+ * SRVs/samplers/blend/depth-stencil/constant buffers/vertex shader+input
+ * layout), since consecutive NV2A kicks usually repeat most of the state.
+ * Clears the queue (s_qn = 0) and bumps s_qgen (so a cached vertex-program
+ * upload from the previous window is not reused across a flush). Also
+ * uploads the rings even when the queue is empty, so a reserved-but-unused
+ * window (see be_draw_x()/be_draw_vsh()'s "may flush: nothing reserved yet"
+ * comments) does not leak into the next one. */
 static void qflush(void)
 {
     static QDraw last;
@@ -2059,11 +2357,18 @@ static RT *prepare(const Nv2aSurface *s, const Nv2aBatchX *b, int prog, QDraw *q
  * every ~5 s, to debug screens that come out wrong. */
 static int s_trace_on = -1, s_trace_frame;
 static uint32_t s_trace_last;
+/* True only during a frame armed for tracing: HITZ_GPU_TRACE=1 is set
+ * (cached here) and be_flip() has armed s_trace_frame for this frame (a
+ * light frame, roughly once every 300 frames, or the frame right after a
+ * trace just printed). */
 static int trace_now(void)
 {
     if (s_trace_on < 0) { const char *e = getenv("HITZ_GPU_TRACE"); s_trace_on = e && *e == '1'; }
     return s_trace_on && s_trace_frame;
 }
+/* Logs one draw_x/draw_vsh/clear call's surface, combiner/texture and render
+ * state, plus (if given) vertex 0's position and first texture coordinate
+ * set, as [TRACE] lines. Only called when trace_now() is true. */
 static void trace_draw(const char *kind, const Nv2aSurface *s, const Nv2aBatchX *b, const Nv2aXVertex *v0)
 {
     const Nv2aRenderState *rs = b->state;
@@ -2086,6 +2391,14 @@ static void trace_draw(const char *kind, const Nv2aSurface *s, const Nv2aBatchX 
                 v0->tex[0][0], v0->tex[0][1], v0->tex[0][2], v0->tex[0][3]);
 }
 
+/* Nv2aBackend.draw_x: queues one already-transformed triangle-list batch
+ * (fixed-function or CPU-run vertex-program output) for the input layout/
+ * vs_main path. Builds the per-draw constants and state via prepare(), then
+ * reserves constant-buffer and vertex-buffer ring space, flushing and
+ * retrying once if either ring's current window is full. Drops the batch
+ * (no draw) if it is empty, the draw queue could not be set up, the batch
+ * does not fit the vertex ring at all, prepare() fails, or ring space is
+ * still unavailable after one flush. */
 static void be_draw_x(const Nv2aSurface *s, const Nv2aBatchX *b)
 {
     if (trace_now()) trace_draw("draw_x", s, b, b->count ? &b->v[0] : NULL);
@@ -2221,6 +2534,8 @@ static void be_draw_vsh(const Nv2aSurface *s, const Nv2aBatchVsh *b)
     }
 }
 
+/* 0xAARRGGBB -> RGB565 (alpha dropped), for the flip readback of a 16-bit
+ * render target. */
 static uint16_t argb_to_565(uint32_t c)
 {
     return (uint16_t)((((c >> 19) & 31) << 11) | (((c >> 10) & 63) << 5) | ((c >> 3) & 31));
@@ -2405,6 +2720,12 @@ static void be_flip(void)
 static const Nv2aBackend s_backend_d3d11 = { be_clear, NULL, be_flip, be_draw_x, be_draw_vsh };
 static const Nv2aBackend s_backend_d3d11_novsh = { be_clear, NULL, be_flip, be_draw_x, NULL };
 
+/* Entry point: called from the game's startup code (main.c) once the
+ * toolkit is otherwise initialised. Registers this back end with the
+ * executor only if HITZ_GPU=1; otherwise the executor keeps rasterising on
+ * the CPU and this file does nothing for the rest of the run. HITZ_GPU_VSH=0
+ * registers the draw_vsh-less variant, keeping vertex programs on the CPU
+ * while draw_x still runs on the GPU. */
 void hitz_gpu_backend_init(void)
 {
     const char *e = getenv("HITZ_GPU");

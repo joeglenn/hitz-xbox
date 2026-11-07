@@ -14,10 +14,10 @@ index ae6228d..0340975 100644
      # 0xC0000135 before main. Proton ships it, so only native Windows shows
 diff --git a/src/input/sdl_pads_win.c b/src/input/sdl_pads_win.c
 new file mode 100644
-index 0000000..4e114b7
+index 0000000..97bca51
 --- /dev/null
 +++ b/src/input/sdl_pads_win.c
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,449 @@
 +/*
 + * sdl_pads_win.c - see sdl_pads_win.h.
 + *
@@ -84,6 +84,8 @@ index 0000000..4e114b7
 +static unsigned         s_order;
 +static HANDLE           s_ready;
 +
++/* Short controller family name for the connected-pad log/notes, from SDL's
++ * SDL_GameControllerType enum value. */
 +static const char *kind_name(int t)
 +{
 +    switch (t) {
@@ -101,6 +103,11 @@ index 0000000..4e114b7
 +    }
 +}
 +
++/* Binds SDL2.dll's exported functions into S by name; called once from
++ * pad_thread before SDL_Init. Looks next to the exe first so a copy bundled
++ * with the game wins over one elsewhere on the search path, falling back to
++ * the normal DLL search. Returns 0 (no non-Xbox pads) if the DLL or any of
++ * the symbols it needs are missing; logs which symbol on failure. */
 +static int load_sdl(void)
 +{
 +    HMODULE m;
@@ -141,6 +148,8 @@ index 0000000..4e114b7
 +    return 1;
 +}
 +
++/* Looks up a tracked slot by SDL instance id; NULL if none (caller holds or
++ * does not need s_lock, depending on context). */
 +static Pad *find(int id)
 +{
 +    int i;
@@ -188,6 +197,12 @@ index 0000000..4e114b7
 +    p->st = s;
 +}
 +
++/* Opens every joystick SDL now lists that this module does not track yet.
++ * Runs on the SDL thread, at startup and about 4 times a second; takes
++ * s_lock while touching a slot. Pads with no SDL controller mapping, and
++ * ones SDL could not open, are recorded as ignored (not retried) and logged
++ * once. Xbox-type pads are also recorded ignored and closed again: XInput
++ * already reads them, and opening both would make one pad count as two. */
 +static void scan(void)
 +{
 +    int n = S.NumJoysticks(), i;
@@ -249,6 +264,8 @@ index 0000000..4e114b7
 +    }
 +}
 +
++/* Refreshes every open pad's snapshot and rumble state, and drops any whose
++ * controller SDL reports detached. Runs every loop of the SDL thread. */
 +static void update(void)
 +{
 +    int i;
@@ -304,6 +321,11 @@ index 0000000..4e114b7
 +    }
 +}
 +
++/* The thread that owns SDL for its whole life: sets the hints, calls
++ * SDL_Init, does the first scan, then loops pumping events, periodically
++ * rescanning for new/removed pads, and refreshing snapshots, until the
++ * process exits (there is no shutdown path). On SDL_Init failure it marks
++ * startup failed and returns so only XInput pads are seen. */
 +static DWORD WINAPI pad_thread(LPVOID unused)
 +{
 +    SDL_version v;
@@ -346,6 +368,11 @@ index 0000000..4e114b7
 +    }
 +}
 +
++/* Starts the SDL pad thread the first time it is called; later calls just
++ * report whether it is up. Honours RECOMP_SDL_PADS=0 (XInput only) and does
++ * nothing if SDL2.dll cannot be loaded. Blocks up to 3 s for the thread's
++ * first scan to finish, so pads already plugged in are visible to the
++ * caller's first read. Called from xinput_device.c's port scanner. */
 +int sdlpads_start(void)
 +{
 +    const char *e;
@@ -379,6 +406,9 @@ index 0000000..4e114b7
 +    return s_started == 2;
 +}
 +
++/* Writes up to max connected, non-ignored pads into out, sorted by
++ * connection order (so the pad that showed up first is always first), and
++ * returns how many. Empty if SDL never came up. */
 +int sdlpads_list(SdlPadInfo *out, int max)
 +{
 +    Pad *sorted[16];
@@ -401,6 +431,9 @@ index 0000000..4e114b7
 +    return n;
 +}
 +
++/* Copies the pad's latest snapshot (as an Xbox pad) into *st; returns 0 if
++ * the id is unknown, ignored, or SDL is not up (caller then treats the pad
++ * as disconnected). */
 +int sdlpads_read(int id, XBOX_INPUT_STATE *st)
 +{
 +    Pad *p;
@@ -417,6 +450,8 @@ index 0000000..4e114b7
 +    return ok;
 +}
 +
++/* Records the rumble motor speeds the game wants; update() applies them
++ * (and keeps resending them) on the SDL thread. No-op if the pad is gone. */
 +void sdlpads_rumble(int id, unsigned short low, unsigned short high)
 +{
 +    Pad *p;
@@ -476,7 +511,7 @@ index 0000000..a1435e0
 +#endif
 +#endif
 diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
-index 5975014..89ffce6 100644
+index 5975014..96ec773 100644
 --- a/src/input/xinput_device.c
 +++ b/src/input/xinput_device.c
 @@ -6,7 +6,7 @@
@@ -488,7 +523,7 @@ index 5975014..89ffce6 100644
   *   POSIX  -> SDL2 GameController
   */
  
-@@ -50,37 +50,204 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
+@@ -50,37 +50,229 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
  
  /* ======================================================================== */
  #if defined(_WIN32)
@@ -521,6 +556,7 @@ index 5975014..89ffce6 100644
 +static CRITICAL_SECTION g_port_cs;
 +static INIT_ONCE        g_port_once = INIT_ONCE_STATIC_INIT;
 +
++/* INIT_ONCE callback: creates the port table's lock. */
 +static BOOL CALLBACK port_init_once(PINIT_ONCE o, PVOID p, PVOID *c)
 +{
 +    (void)o; (void)p; (void)c;
@@ -530,6 +566,8 @@ index 5975014..89ffce6 100644
  
 -/* The keyboard on port 0 (RECOMP_KEYBOARD=1) comes from keyboard.c, shared
 - * with the SDL backend; the GDI window in fb_present.c records the keys. */
++/* Port currently holding this (kind, id) source, or -1. Caller holds
++ * g_port_cs. */
 +static int port_of(int kind, int id)
 +{
 +    int i;
@@ -540,6 +578,8 @@ index 5975014..89ffce6 100644
 +}
  
 -void xbox_InputInit(void)
++/* Assigns (kind, id) to the lowest free port and logs it; logs and drops the
++ * pad instead if every port is already taken. Caller holds g_port_cs. */
 +static void port_attach(int kind, int id, const char *name)
 +{
 +    int i;
@@ -556,6 +596,7 @@ index 5975014..89ffce6 100644
 +            name, XBOX_MAX_CONTROLLERS);
 +}
 +
++/* Clears a port's source and logs the removal. Caller holds g_port_cs. */
 +static void port_detach(int port)
  {
 -    for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
@@ -610,6 +651,7 @@ index 5975014..89ffce6 100644
 +    LeaveCriticalSection(&g_port_cs);
 +}
 +
++/* Runs port_scan once a second for the life of the process. */
 +static DWORD WINAPI port_thread(LPVOID unused)
 +{
 +    (void)unused;
@@ -619,6 +661,10 @@ index 5975014..89ffce6 100644
 +    }
 +}
 +
++/* INIT_ONCE callback for the whole port-assignment subsystem: brings up the
++ * port lock, starts the SDL pad thread, does the first scan so pads already
++ * plugged in are assigned before the game's first read, and starts the
++ * background rescan thread. */
 +static BOOL CALLBACK port_start_once(PINIT_ONCE o, PVOID p, PVOID *c)
 +{
 +    HANDLE th;
@@ -636,16 +682,24 @@ index 5975014..89ffce6 100644
 +
 +static INIT_ONCE g_start_once = INIT_ONCE_STATIC_INIT;
 +
++/* Runs port_start_once exactly once; cheap to call from every entry point
++ * that needs the port table up (xbox_InputInit and the state/capability
++ * queries, in case the game never calls xbox_InputInit). */
 +static void port_maybe_scan(void)
 +{
 +    InitOnceExecuteOnce(&g_start_once, port_start_once, NULL, NULL);
 +}
 +
++/* Brings up the port-assignment subsystem (XInput + SDL scanning) the first
++ * time it runs; a no-op after that. */
 +void xbox_InputInit(void)
 +{
 +    port_maybe_scan();
-+}
-+
+ }
+ 
++/* XINPUT_STATE -> XBOX_INPUT_STATE: unpacks wButtons into the four face
++ * buttons (as 0/255 analog values) and the digital bits, and copies the
++ * triggers and sticks through unchanged. */
 +static void from_xinput(const XINPUT_STATE *xi, XBOX_INPUT_STATE *pState)
 +{
 +    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
@@ -669,8 +723,14 @@ index 5975014..89ffce6 100644
 +    pState->Gamepad.sThumbLY = xi->Gamepad.sThumbLY;
 +    pState->Gamepad.sThumbRX = xi->Gamepad.sThumbRX;
 +    pState->Gamepad.sThumbRY = xi->Gamepad.sThumbRY;
- }
- 
++}
++
++/* Reads the pad assigned to dwPort, whichever backend (XInput or SDL) it
++ * came from; on read failure from an XInput pad, detaches its port so the
++ * next port_scan can hand the slot to someone else. Port 0 falls back to
++ * the keyboard/mouse (keyboard_merge, mkb_merge) when no pad answers, and
++ * merges them on top of a real pad too. Called from the game's input
++ * thread; may block briefly on its first call (port_maybe_scan). */
  DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
  {
 -    XINPUT_STATE xi_state;
@@ -707,7 +767,7 @@ index 5975014..89ffce6 100644
          g_controller_connected[dwPort] = FALSE;
          if (dwPort == 0) {
              /* Keyboard and mouse stand in for an absent pad, so the game is
-@@ -93,36 +260,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+@@ -93,36 +285,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
              if (kb || mkb_enabled())
                  return ERROR_SUCCESS;
          }
@@ -745,8 +805,13 @@ index 5975014..89ffce6 100644
      if (dwPort == 0)
          keyboard_merge(pState);
  
-@@ -136,14 +277,25 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+@@ -134,16 +300,30 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+     return ERROR_SUCCESS;
+ }
  
++/* Forwards a vibration request to whichever backend holds dwPort's pad
++ * (XInputSetState for XInput, sdlpads_rumble for SDL); ERROR_DEVICE_NOT_CONNECTED
++ * if the port is empty. */
  DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
  {
 -    XINPUT_VIBRATION xi_vib;
@@ -776,8 +841,13 @@ index 5975014..89ffce6 100644
  }
  
  BOOL xbox_InputIsConnected(DWORD dwPort)
-@@ -154,20 +306,31 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
+@@ -152,22 +332,36 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
+     return g_controller_connected[dwPort];
+ }
  
++/* Capabilities for whichever backend holds dwPort's pad: a real
++ * XINPUT_CAPABILITIES for an XInput pad, or a generic gamepad/gamepad
++ * report for an SDL one (SDL has no equivalent query). */
  DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
  {
 -    XINPUT_CAPABILITIES xi_caps;
@@ -820,10 +890,34 @@ index 5975014..89ffce6 100644
  
  /* ======================================================================== */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 10d00f4..5761c2d 100644
+index 10d00f4..0326535 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
-@@ -30,6 +30,7 @@
+@@ -23,6 +23,23 @@
+  *   Kernel functions receive Xbox pointers (32-bit VAs) that must be translated
+  *   to native pointers by adding g_xbox_mem_offset. Different functions have
+  *   different parameter layouts (pointer vs value), so each needs its own bridge.
++ *
++ * Project additions in this file:
++ *   - xbox_SignalGuestEvent: lets a device model (the NV2A executor, on its own
++ *     thread) set a guest KEVENT the way the console's interrupt controller
++ *     would, for titles that wait on a GPU interrupt rather than polling.
++ *   - xbox_VblankDiscipline / xbox_VblankLockErrorUs: steers the paced vblank
++ *     schedule onto the host display's real refresh, when it is a 60 Hz
++ *     multiple, so presented frames land one per vblank instead of drifting
++ *     against the monitor over time.
++ *   - kernel_set_timer's first-use init is made race-free (InterlockedCompareExchange
++ *     on g_timer_started): two guest threads racing to set the first timer used
++ *     to each start the timer thread and lock.
++ *   - kernel_thunk_dispatch_body gains optional performance-log instrumentation
++ *     (RECOMP_PERF_LOG=1, platform/perf_log.h): per-call timing for slow kernel
++ *     calls, and a one-thread-only periodic summary.
++ *   - RECOMP_READ_LOG gates the [READ] trace in bridge_NtReadFile (log_gate_read);
++ *     off by default, since every call paid for it unconditionally before.
+  */
+ 
+ #include "kernel.h"
+@@ -30,6 +47,7 @@
  #include "kernel_missing.h"
  #include "xbox_memory_layout.h"
  #include "platform/host_time.h"
@@ -831,7 +925,7 @@ index 10d00f4..5761c2d 100644
  #include "recomp_icall_feedback.h"
  #include <stdio.h>
  /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
-@@ -2002,6 +2003,33 @@ static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
+@@ -2002,6 +2020,36 @@ static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
      return h;
  }
  
@@ -855,6 +949,9 @@ index 10d00f4..5761c2d 100644
 +    return 0;
 +}
 +
++/* Gate for the [READ] trace in bridge_NtReadFile (RECOMP_READ_LOG=1): off by
++ * default, since a title issues many reads a frame and the trace line is one
++ * of the costlier things this runtime can do per call. */
 +static int log_gate_read(void)
 +{
 +    static int on = -1;
@@ -865,7 +962,7 @@ index 10d00f4..5761c2d 100644
  /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
  static void bridge_KeSetEvent(void)
  {
-@@ -3224,9 +3252,92 @@ static void kernel_vblank_raise(void)
+@@ -3224,9 +3272,96 @@ static void kernel_vblank_raise(void)
   * edge, 0 when vblanks are off. */
  #define VBLANK_RESTART_NS 100000000ull
  
@@ -906,6 +1003,10 @@ index 10d00f4..5761c2d 100644
 +    return (int)g_lock_err_us;
 +}
 +
++/* The schedule's next due time: t0_ns plus n periods. s_vbl_period_ns is
++ * either the fixed 60 Hz default or the display-locked period computed by
++ * vblank_discipline_apply (xbox_VblankDiscipline); only the timer thread
++ * touches it, so no lock is needed here. */
  static uint64_t vblank_due(uint64_t t0_ns, uint64_t n)
  {
 -    return t0_ns + n * 1000000000ull / 60u;
@@ -959,7 +1060,7 @@ index 10d00f4..5761c2d 100644
  }
  
  static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
-@@ -3243,6 +3354,7 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
+@@ -3243,6 +3378,7 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
          t0_ns = now_ns;
          count = 0;
      }
@@ -967,7 +1068,7 @@ index 10d00f4..5761c2d 100644
      due = vblank_due(t0_ns, count);
      if (now_ns < due) {
          *next_due_ns = due;
-@@ -3602,7 +3714,7 @@ typedef struct {
+@@ -3602,7 +3738,7 @@ typedef struct {
  } XboxTimer;
  static XboxTimer g_timers[XBOX_MAX_TIMERS];
  static CRITICAL_SECTION g_timer_lock;
@@ -976,7 +1077,7 @@ index 10d00f4..5761c2d 100644
  
  /* Whether the timer thread runs the paced loop below (kernel_timer_loop_ns):
   * only for what needs it, the 60 Hz vblank (RECOMP_VBLANK=paced) and the
-@@ -3806,10 +3918,16 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+@@ -3806,10 +3942,16 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      int i, free_slot = -1;
      uint32_t was_set = 0;
  
@@ -995,7 +1096,7 @@ index 10d00f4..5761c2d 100644
      }
  
      EnterCriticalSection(&g_timer_lock);
-@@ -4255,6 +4373,8 @@ static NTSTATUS bridge_create_file_impl(
+@@ -4255,6 +4397,8 @@ static NTSTATUS bridge_create_file_impl(
              fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X\n",
                      gpath, (unsigned)disposition, (unsigned)options,
                      g_xbox_kernel_caller, status);
@@ -1004,7 +1105,7 @@ index 10d00f4..5761c2d 100644
      }
      fflush(stderr);
      return st;
-@@ -4756,7 +4876,9 @@ static void bridge_NtReadFile(void)
+@@ -4756,7 +4900,9 @@ static void bridge_NtReadFile(void)
           * whatever precedes the file it actually wants, and a read that stops
           * early looks identical to one that never started -- until you can
           * see where each one landed. */
@@ -1015,7 +1116,22 @@ index 10d00f4..5761c2d 100644
              fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                      g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                      (long long)off.QuadPart, length, got,
-@@ -10840,10 +10962,15 @@ static void kernel_thunk_dispatch_body(void)
+@@ -10801,6 +10947,14 @@ static void kernel_thunk_dispatch(void)
+         xbox_GuestCpuAcquire();
+ }
+ 
++/* Runs the bridge for one kernel ordinal, with the performance log's two
++ * instrumentation layers wrapped around it when RECOMP_PERF_LOG=1: a 2 s
++ * summary of call counts (printed by exactly one thread even when several
++ * cross the time check in the same tick), and per-call timing that reports
++ * any call over 8 ms as a slow-kernel-call line (waits -- the handful of
++ * ordinals excluded by number -- are left out because a wait being slow is
++ * the point, not a stall to chase). Called with the guest CPU released (see
++ * kernel_thunk_dispatch); runs on whichever guest thread made the call. */
+ static void kernel_thunk_dispatch_body(void)
+ {
+     int slot = g_kernel_dispatch_slot;
+@@ -10840,10 +10994,15 @@ static void kernel_thunk_dispatch_body(void)
      }
  
      {
@@ -1034,7 +1150,7 @@ index 10d00f4..5761c2d 100644
              fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                      g_kernel_call_count, ordinal, slot, g_esp);
              /* And which ones, ranked. "Latest" names whatever the sample
-@@ -10869,7 +10996,11 @@ static void kernel_thunk_dispatch_body(void)
+@@ -10869,7 +11028,11 @@ static void kernel_thunk_dispatch_body(void)
                  }
              }
              fflush(stderr);
@@ -1047,7 +1163,7 @@ index 10d00f4..5761c2d 100644
          }
      }
  
-@@ -10914,7 +11045,31 @@ static void kernel_thunk_dispatch_body(void)
+@@ -10914,7 +11077,31 @@ static void kernel_thunk_dispatch_body(void)
      }
  
      if (bridge) {
@@ -1081,10 +1197,24 @@ index 10d00f4..5761c2d 100644
          /* No specific bridge - return 0. Warn once per ordinal rather than
           * gating on g_kernel_call_count: a missing bridge is rare and is
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
-index 2651871..a357961 100644
+index 2651871..64f3dc0 100644
 --- a/src/kernel/kernel_file.c
 +++ b/src/kernel/kernel_file.c
-@@ -285,8 +285,12 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+@@ -235,6 +235,13 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+     return xbox_translate_path(xbox_path, win_path, buf_size);
+ }
+ 
++/* Opens or creates a file for a translated Xbox path. Buffering is always
++ * left host-cached: XBOX_FILE_NO_INTERMEDIATE_BUFFERING is deliberately not
++ * forwarded to FILE_FLAG_NO_BUFFERING (see the comment at that check below).
++ * An overwrite of a non-empty existing file is deferred (overwrite_take) and
++ * only committed when data is actually written, so a title that opens with
++ * CREATE/OVERWRITE semantics but reads before it writes still sees the old
++ * contents, as it would on the console. */
+ NTSTATUS __stdcall xbox_NtCreateFile(
+     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+@@ -285,8 +292,12 @@ NTSTATUS __stdcall xbox_NtCreateFile(
              xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
              FILE_FLAG_BACKUP_SEMANTICS, NULL);
      } else {
@@ -1099,7 +1229,20 @@ index 2651871..a357961 100644
          if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
              flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
          DWORD access = xbox_access_to_win32(DesiredAccess);
-@@ -391,8 +395,43 @@ NTSTATUS __stdcall xbox_NtReadFile(
+@@ -357,6 +368,12 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+     return STATUS_SUCCESS;
+ }
+ 
++/* Reads from an open file handle, translating the Xbox IO_STATUS_BLOCK
++ * result. On ERROR_NOACCESS the read is retried once through a host-memory
++ * bounce buffer and copied into the guest buffer afterwards (see below):
++ * ReadFile writing the guest buffer directly can fail outright on a page the
++ * runtime is watching for faults, where the console would have trapped and
++ * continued. */
+ NTSTATUS __stdcall xbox_NtReadFile(
+     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+@@ -391,8 +408,43 @@ NTSTATUS __stdcall xbox_NtReadFile(
          return STATUS_SUCCESS;
      }
  
@@ -1146,10 +1289,25 @@ index 2651871..a357961 100644
      IoStatusBlock->Information = 0;
      return STATUS_UNSUCCESSFUL;
 diff --git a/src/kernel/kernel_memory.c b/src/kernel/kernel_memory.c
-index e66e3de..7810015 100644
+index e66e3de..45eae27 100644
 --- a/src/kernel/kernel_memory.c
 +++ b/src/kernel/kernel_memory.c
-@@ -186,6 +186,10 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
+@@ -164,6 +164,14 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
+         VirtualFree(BaseAddress, 0, MEM_RELEASE);
+ }
+ 
++/* Translates a guest virtual address to the "physical" number a title hands
++ * to the GPU or a device model. Also records, in xbox_memory_layout.c's
++ * physical-number maps, whether the number names RAM (xbox_PhysNoteRamName)
++ * or a page still inside the loaded XBE image (xbox_PhysNoteImageName): a
++ * device model given a number inside the image range (titles do this for
++ * driver buffers that are really static data, e.g. NHL Hitz Pro's XPP
++ * descriptors) cannot otherwise tell it apart from a contiguous-allocator
++ * page, since both ranges overlap. */
+ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
+ {
+     /*
+@@ -186,6 +194,10 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
      /* The same number can be a window page; record that the title meant RAM
       * (xbox_PhysNoteRamName says why the APU needs to know). */
      xbox_PhysNoteRamName(va);
@@ -1161,10 +1319,23 @@ index e66e3de..7810015 100644
  }
  
 diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
-index 2f1edbb..c6626de 100644
+index 2f1edbb..6b7c638 100644
 --- a/src/kernel/kernel_path.c
 +++ b/src/kernel/kernel_path.c
-@@ -620,8 +620,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
+@@ -576,7 +576,11 @@ static void xbox_remember_host_path(const wchar_t *p)
+ }
+ 
+ 
+-
++/* Translates one Xbox path (a device-relative or drive-letter path, e.g.
++ * "D:\\default.xbe" or "\\Device\\Harddisk0\\Partition1\\...") to a host path,
++ * matching it against the rule table (s_rules) built by xbox_path_init.
++ * RECOMP_PATH_LOG=1 traces every translated path to stderr; off by default
++ * because a title can call this many times a frame. */
+ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
+ {
+     const char*  remainder = NULL;
+@@ -620,8 +624,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
  translate:
      if (g_xbox_path_hook)
          g_xbox_path_hook(xbox_path);
@@ -1303,10 +1474,39 @@ index 327f01d..321c105 100644
   * of the semaphore the title reads GPU progress from (for XDK D3D, the
   * pointer at device+0x30). The executor writes each release there once it
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a513bc7..94cbb1f 100644
+index a513bc7..1b74604 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
-@@ -379,6 +379,13 @@ static float reg_f(uint32_t method)
+@@ -23,6 +23,28 @@
+  * after every clear, which separates "the pixel path is broken" from "the title
+  * has not given us any vertices". RECOMP_FB_DUMP=<prefix> writes the surface to
+  * <prefix>NNN.bmp, so the result can be looked at without a display.
++ *
++ * Project additions in this file (a registered Nv2aBackend, nv2a_backend.h,
++ * turns this from a CPU rasteriser into a command decoder feeding a GPU
++ * renderer):
++ *   - draw_x: full-state triangle batches (register combiner, all four
++ *     texture stages, fog) handed to a back end instead of rasterised here.
++ *     backend_fill_x/backend_flush_x/backend_xslot build and flush them;
++ *     raster_xf_triangle and raster_indexed route into this path instead of
++ *     the old per-vertex Nv2aVertex one when a draw_x back end is set.
++ *   - draw_vsh: vertex-program batches handed over untransformed
++ *     (backend_vsh_batch) so the program itself can run on the GPU; falls
++ *     back to the CPU interpreter (nv2a_vsh_interp.c) for inline arrays,
++ *     c[]-writing programs and out-of-range attributes.
++ *   - A post-transform vertex cache in raster_batch_program (RECOMP_NO_VCACHE=1
++ *     disables): an indexed batch reuses each vertex several times, so caching
++ *     a transformed vertex by index avoids re-running the program for it.
++ *   - nv2a_pb_set_swmethod_callback / the software-method interrupt in
++ *     nv2a_pb_exec_method: lets a project answer D3D's own interrupt-driven
++ *     fence wait (its GPU ISR on real hardware) instead of only polling.
++ *   - [PERF] vertex-program vs. raster timing and RECOMP_DRAW_LOG /
++ *     RECOMP_INLINE_LOG gated trace lines, in nv2a_pb_exec_report and
++ *     draw_primitive / draw_inline_array.
+  */
+ #include <math.h>
+ #include <stdio.h>
+@@ -379,6 +401,13 @@ static float reg_f(uint32_t method)
  static uint32_t s_sem_va;
  void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
  
@@ -1320,16 +1520,28 @@ index a513bc7..94cbb1f 100644
  /* Unhandled methods, ranked. The interesting output is not that something was
   * skipped but which things dominate, because that is the order to implement
   * them in. */
-@@ -782,7 +789,7 @@ void nv2a_backend_register(const Nv2aBackend *backend)
+@@ -780,11 +809,19 @@ void nv2a_backend_register(const Nv2aBackend *backend)
+     s_backend = backend;
+ }
  
++/* Whether anything is registered that can turn batches into pixels: either
++ * draw() (the original per-vertex Nv2aVertex path) or draw_x() (the
++ * full-state path a draw_x back end uses instead). */
  static int backend_draws(void)
  {
 -    return s_backend && s_backend->draw;
 +    return s_backend && (s_backend->draw || s_backend->draw_x);
  }
  
++/* Fills a back end's view of the current render target from the executor's
++ * own state (s_gpu): surface geometry and anti-aliasing as before, plus the
++ * clip origin, raw SET_SURFACE_FORMAT bits, swizzle/size and zeta depth
++ * range that a draw_x back end needs to reproduce the same pixels the CPU
++ * rasteriser would have written. */
  static void current_surface(Nv2aSurface *out)
-@@ -794,6 +801,13 @@ static void current_surface(Nv2aSurface *out)
+ {
+     out->color_va        = dma_resolve(s_gpu.color_offset);
+@@ -794,6 +831,13 @@ static void current_surface(Nv2aSurface *out)
      out->bytes_per_pixel = surface_bpp();
      out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
      out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
@@ -1343,7 +1555,7 @@ index a513bc7..94cbb1f 100644
  }
  
  /* Render state in the NV2A's own values, gathered from what the executor
-@@ -2024,10 +2038,104 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+@@ -2024,10 +2068,123 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
      o->v = v->tex[0][1] * sv;
  }
  
@@ -1355,6 +1567,10 @@ index a513bc7..94cbb1f 100644
 +static void backend_fill_x(Nv2aBatchX *bp, const Nv2aRenderState *rs, int textured,
 +                           int from_screen, int no_rc);
 +
++/* Returns a pointer to the next free vertex slot in the draw_x vertex
++ * buffer (allocated on first use), or NULL once NV_BACKEND_MAX_VERTS would
++ * be exceeded or the allocation failed -- callers then fall back to
++ * flushing what has accumulated so far. */
 +static Nv2aXVertex *backend_xslot(void)
 +{
 +    if (!s_xverts
@@ -1365,6 +1581,13 @@ index a513bc7..94cbb1f 100644
 +    return &s_xverts[s_xcount];
 +}
 +
++/* Converts whatever screen-space vertices (raster_indexed's Nv2aVertex path)
++ * accumulated in s_bverts into Nv2aXVertex and appends them to the draw_x
++ * buffer, then flushes the whole buffer to the back end's draw_x callback.
++ * Screen-space batches have no fog or real texture coordinate set, so they
++ * are widened with flat defaults (fog 1.0, stage 0 in texels). The caller of
++ * backend_flush routes here instead of the per-vertex draw() path whenever
++ * a draw_x back end is registered. */
 +static void backend_flush_x(int textured)
 +{
 +    static int no_rc = -1;
@@ -1408,6 +1631,14 @@ index a513bc7..94cbb1f 100644
 +    note_drawn();
 +}
 +
++/* Fills bp with per-texture-stage and render-state fields from the
++ * executor's own state (s_gpu): the four stages' addressing/filtering, the
++ * register combiner (unless RECOMP_NO_COMBINERS or the batch is
++ * screen-space, where combiners never applied), and whether stage 0's
++ * coordinates are normalised (0..1) or already in texels (from_screen).
++ * `*bp` is a local copy in each caller rather than written in place, so it
++ * can be filled before the caller's own Nv2aBatchX fields (v, count) are
++ * known. */
 +static void backend_fill_x(Nv2aBatchX *bp, const Nv2aRenderState *rs, int textured,
 +                           int from_screen, int no_rc)
 +{
@@ -1448,7 +1679,19 @@ index a513bc7..94cbb1f 100644
      Nv2aSurface surf;
      Nv2aRenderState rs;
      Nv2aTexture tex;
-@@ -2679,6 +2787,22 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2645,6 +2802,11 @@ static void xf_queue_push(const XfTri *T)
+     s_xfq_px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
+ }
+ 
++/* One transformed-and-lit triangle (vertex-program output, already in
++ * surface pixels with w, colour, fog and up to four texture coordinate
++ * sets). With a draw_x back end registered this only buffers the three
++ * Nv2aXVertex into the draw_x queue (backend_xslot) and returns; otherwise
++ * it falls through to the CPU rasteriser below. */
+ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+                                const Nv2aVshOutput *vc)
+ {
+@@ -2679,6 +2841,22 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
          s_gpu.xf_degenerate++;
          return;
      }
@@ -1471,7 +1714,7 @@ index a513bc7..94cbb1f 100644
      if (backend_draws()) {                     /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          if (o) {
-@@ -2927,15 +3051,168 @@ static void xf_set_viewport(void)
+@@ -2927,15 +3105,183 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -1479,6 +1722,13 @@ index a513bc7..94cbb1f 100644
 + * fall back to the CPU path (inline arrays, constant-writing programs, an
 + * attribute outside guest memory). */
 +static uint32_t *s_vsh_idx;
++/* Builds a Nv2aBatchVsh (raw attribute ranges, a triangle-list index array
++ * relative to the batch's lowest index, the uploaded program and constants)
++ * and hands it to the registered draw_vsh back end, so the vertex program
++ * runs on the GPU instead of nv2a_vsh_interp.c's CPU interpreter. Declines
++ * (returns 0) for points/lines, inline-array batches, programs that write
++ * c[] (nv2a_vsh_cxt_write), or an attribute range outside guest memory --
++ * raster_batch_program then falls back to the CPU path for those. */
 +static int backend_vsh_batch(void)
 +{
 +    static int no_rc = -1;
@@ -1591,6 +1841,14 @@ index a513bc7..94cbb1f 100644
 +
 +/* Per-report-window cost of the CPU geometry path (printed as [PERF]). */
 +static unsigned long long s_perf_vsh_ns, s_perf_rast_ns, s_perf_verts, s_perf_t_rast0;
++/* Runs the uploaded vertex program over a batch's indices and rasterises the
++ * result. Tries the GPU path first (backend_vsh_batch, when a draw_vsh back
++ * end is registered and the batch does not need the CPU fallback); otherwise
++ * transforms each distinct index once through nv2a_vsh_interp.c, using a
++ * direct-mapped post-transform cache (RECOMP_NO_VCACHE=1 disables) since an
++ * indexed list reuses each vertex several times, then rasterises through the
++ * registered back end or the CPU path. Accumulates s_perf_vsh_ns /
++ * s_perf_rast_ns for nv2a_pb_exec_report's [PERF] line. */
  static void raster_batch_program(void)
  {
      uint32_t i, n = s_gpu.idx_count;
@@ -1643,7 +1901,7 @@ index a513bc7..94cbb1f 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3067,6 +3344,7 @@ static void raster_batch_program(void)
+@@ -3067,6 +3413,7 @@ static void raster_batch_program(void)
      xf_queue_flush();
      if (backend_draws())
          backend_flush(!s_xf_no_tex);
@@ -1651,10 +1909,12 @@ index a513bc7..94cbb1f 100644
  }
  
  static void raster_batch(void)
-@@ -3204,6 +3482,13 @@ static void frame_trace_flip(void)
+@@ -3204,6 +3551,19 @@ static void frame_trace_flip(void)
      }
  }
  
++/* Gate for the "draw #" progress line (RECOMP_DRAW_LOG=1): off by default
++ * since draw_primitive runs once per title draw call. */
 +static int log_gate_draw(void)
 +{
 +    static int on = -1;
@@ -1662,10 +1922,14 @@ index a513bc7..94cbb1f 100644
 +    return on;
 +}
 +
++/* Entry point for one NV097 draw call (DRAW_ARRAYS / DRAW_INDEX_ARRAY):
++ * counts it, rasterises through whichever path is active (fixed-function,
++ * vertex-program, inline array), and resets the per-draw state the next
++ * draw expects to start clean. */
  static void draw_primitive(void)
  {
      float v[4];
-@@ -3212,7 +3497,7 @@ static void draw_primitive(void)
+@@ -3212,7 +3572,7 @@ static void draw_primitive(void)
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
      s_gpu.draws++;
@@ -1674,7 +1938,7 @@ index a513bc7..94cbb1f 100644
          fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
      s_gpu.verts += s_gpu.idx_count;
  
-@@ -3383,31 +3668,55 @@ static void draw_primitive(void)
+@@ -3383,31 +3743,61 @@ static void draw_primitive(void)
   * The title's own attribute table is saved and put back: these offsets and
   * strides are ours, and it has not stopped using its.
   *
@@ -1714,6 +1978,12 @@ index a513bc7..94cbb1f 100644
 +    fprintf(stderr, "%s\n", line);
 +}
 +
++/* An inline-array batch (vertices pushed through the pushbuffer itself, not
++ * read from guest memory by stride): computes each attribute's offset in the
++ * packed per-vertex layout (attr_elem_bytes, dword-padded, as the hardware
++ * packs them -- see the comment above about the green/black ice-texture
++ * streak this layout fixes) and draws from the inline data with that layout
++ * temporarily substituted for the title's own attribute table. */
  static void draw_inline_array(void)
  {
      VertexAttr saved[NV_VERTEX_ATTRS];
@@ -1742,7 +2012,7 @@ index a513bc7..94cbb1f 100644
      if (!vsize)
          goto out;
  
-@@ -3669,6 +3978,12 @@ static uint64_t s_vbl_moved_ns;
+@@ -3669,6 +4059,12 @@ static uint64_t s_vbl_moved_ns;
   * most of a frame. */
  static uint32_t s_walk_vbl;
  
@@ -1755,7 +2025,23 @@ index a513bc7..94cbb1f 100644
  void nv2a_pb_exec_walk_begin(void)
  {
      s_walk_vbl = xbox_VblankCount();
-@@ -3839,7 +4154,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3744,6 +4140,15 @@ static void flip_hold_report(void)
+     h->held_ns = 0;
+ }
+ 
++/* Executes one method from the pushbuffer: the executor's main dispatch,
++ * called by the scan/walk for every (subchannel, method, parameter) it
++ * decodes, on the executor (NV2A poll) thread. Handles state-setting
++ * methods, draw triggers, clears, semaphore releases/latches and the
++ * software-method (NO_OPERATION with a non-zero parameter) interrupt that
++ * runs a registered callback (nv2a_pb_set_swmethod_callback) so a project
++ * can answer whatever D3D's interrupt handler would do on real hardware;
++ * everything else is counted and ranked (note_unhandled) rather than acted
++ * on. */
+ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+ {
+     static int inited;
+@@ -3839,7 +4244,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
       * enter it. So for a mirrored fence the latch carries the mirror's fence
       * bits and the marker's address, which is what a GPU that had consumed
       * everything would report. */
@@ -1770,7 +2056,7 @@ index a513bc7..94cbb1f 100644
          volatile uint32_t *r = xbox_Nv2aRegPtr(0x400B10);
  
          if (!r)
-@@ -4029,6 +4350,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4029,6 +4440,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* Non-zero, it is one of D3D's software methods, which the GPU traps
           * to D3D's interrupt handler on the console. Only the swap's interval
           * matters here (nv2a_flip_hold.h); the rest stays a no-op. */
@@ -1779,7 +2065,18 @@ index a513bc7..94cbb1f 100644
          if (!nv2a_pb_exec_flip_pacing()) {
              if (!imm_vertex_method(method, param))
                  note_unhandled(method, param);   /* as before the hold */
-@@ -4456,6 +4779,15 @@ void nv2a_pb_exec_report(void)
+@@ -4428,6 +4841,10 @@ static void peek_chain(void)
+     fflush(stderr);
+ }
+ 
++/* Prints the executor's periodic [GPU]/[PERF]/[FLIP] bring-up report
++ * (RECOMP_GPU_REPORT=1, via nv2a_pb_scan_report): unhandled-method ranking,
++ * flip-hold stats, the CPU geometry-path [PERF] line (vertex-program time
++ * vs. raster time per window) and the current surface/clip state. */
+ void nv2a_pb_exec_report(void)
+ {
+     peek_addresses();
+@@ -4456,6 +4873,15 @@ void nv2a_pb_exec_report(void)
          last_flips = s_gpu.flips;
          last_ms = now;
      }
@@ -1795,7 +2092,7 @@ index a513bc7..94cbb1f 100644
      flip_hold_report();
      fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                      " clears %u | %u unhandled methods (%d distinct)\n",
-@@ -4572,3 +4904,26 @@ void nv2a_pb_exec_report(void)
+@@ -4572,3 +4998,26 @@ void nv2a_pb_exec_report(void)
          s_unhandled_slot[(s_unhandled[i].method & 0x1FFC) / 4] = (uint16_t)(i + 1);
      fflush(stderr);
  }
@@ -1823,10 +2120,25 @@ index a513bc7..94cbb1f 100644
 +    return 1;
 +}
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
-index e3a16e2..1d65703 100644
+index e3a16e2..5a2d72b 100644
 --- a/src/kernel/nv2a_pb_scan.c
 +++ b/src/kernel/nv2a_pb_scan.c
-@@ -27,6 +27,10 @@
+@@ -19,6 +19,14 @@
+  *   (w & 0xFFFF0003) == 0x00020000  return
+  * For a method header: count = (w >> 18) & 0x7FF, subchannel = (w >> 13) & 7,
+  * method = w & 0x1FFC.
++ *
++ * Project additions in this file: an alternate top-level walk,
++ * nv2a_pb_scan (RECOMP_PB_WALK=dma), that follows JUMP/CALL like the real
++ * engine and publishes DMA_GET as it goes, with bounds checking
++ * (pb_va_ok) against reading outside guest RAM. nv2a_pb_dma_pending /
++ * nv2a_pb_dma_get let the ack thread resume a walk that stopped at a held
++ * flip. nv2a_pb_scan_segment_timed is the original per-flush segment walk,
++ * kept as the default and now timed per report window.
+  */
+ #include <stdio.h>
+ #include <stdint.h>
+@@ -27,6 +35,10 @@
  #include <string.h>
  
  extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -1837,7 +2149,15 @@ index e3a16e2..1d65703 100644
  
  #define PB_MAX_METHODS 4096
  
-@@ -155,6 +159,12 @@ static const char *nv097_name(uint32_t m)
+@@ -152,9 +164,20 @@ static const char *nv097_name(uint32_t m)
+     return "";
+ }
+ 
++/* Prints the bring-up survey: distinct (subchannel, method) pairs seen, the
++ * executor's own report, and total segment/word/jump/call counts.
++ * RECOMP_GPU_REPORT=1 gates it (also required for the [GPU]/[TEXUSE] detail
++ * nv2a_pb_exec_report prints): the survey costs the executor thread several
++ * percent, so it is off unless asked for. */
  void nv2a_pb_scan_report(void)
  {
      int i;
@@ -1850,22 +2170,39 @@ index e3a16e2..1d65703 100644
  
      if (s_exec_enabled > 0) {
          nv2a_pb_exec_report();
-@@ -295,10 +305,23 @@ static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
+@@ -295,10 +318,40 @@ static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
      }
  }
  
 +/* DMA walk state for the ack thread: whether the walk stopped short of the
 + * last PUT (a held flip), and the GET it published. */
 +static uint32_t s_dma_put = 0xFFFFFFFFu;
++/* Whether the DMA walk (nv2a_pb_scan, RECOMP_PB_WALK=dma) has unconsumed
++ * work: GET has not caught up to the PUT it last saw. The ack thread
++ * (xbox_memory_layout.c's nv2a_ack_thread) uses this to resume a walk that
++ * stopped at a flip hold even when the title has not advanced PUT again. */
 +int nv2a_pb_dma_pending(void)
 +{
 +    return s_get != 0xFFFFFFFFu && s_dma_put != 0xFFFFFFFFu && s_get != s_dma_put;
 +}
++/* Where the DMA walk currently has GET: where it stopped, which is PUT if it
++ * ran to completion or a held FLIP_STALL otherwise. The ack thread publishes
++ * this to the hardware GET register instead of always writing PUT. */
 +uint32_t nv2a_pb_dma_get(void)
 +{
 +    return s_get;
 +}
 +
++/* Walks the pushbuffer from the last GET up to put_phys, following JUMP/CALL
++ * like the hardware engine, publishing GET into the DMA_GET register as it
++ * goes (RECOMP_PB_WALK=dma). Called once per flush from the ack thread.
++ * Stops early, leaving GET short of PUT, at a FLIP_STALL that just armed the
++ * flip hold (nv2a_pb_exec_flip_held): the hold's own release, not this walk,
++ * decides when the title may see its flip complete -- the DMA walk with the
++ * software-method interrupt replaced the segment-scan default
++ * (nv2a_pb_scan_segment) because the scan set GET to PUT before D3D's fence
++ * sequence had finished, which could miss the fence's notify and hang
++ * Present forever. */
  void nv2a_pb_scan(uint32_t put_phys)
  {
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -1874,7 +2211,7 @@ index e3a16e2..1d65703 100644
      volatile uint32_t *get_reg = NULL;
      uint32_t words = 0, jumps = 0, unknown = 0;
  
-@@ -308,14 +331,23 @@ void nv2a_pb_scan(uint32_t put_phys)
+@@ -308,14 +361,23 @@ void nv2a_pb_scan(uint32_t put_phys)
          s_get = put, s_pend_left = 0;
          return;
      }
@@ -1899,7 +2236,7 @@ index e3a16e2..1d65703 100644
  
          if (get_reg) {
              uint32_t g = *get_reg;
-@@ -466,6 +498,17 @@ int nv2a_pb_dma_walk(void)
+@@ -466,6 +528,28 @@ int nv2a_pb_dma_walk(void)
  static int s_in_call;
  int nv2a_pb_scan_in_call(void) { return s_in_call; }
  
@@ -1907,6 +2244,11 @@ index e3a16e2..1d65703 100644
 + * contiguous window. A stale or half-written CALL/JUMP word otherwise sends
 + * the walker anywhere in the host address space. */
 +static unsigned long s_pb_bad;
++/* True if va (and the dword at va) lies inside guest RAM: the low 64 MB
++ * mirror, or the contiguous window at XBOX_CONTIG_BASE. pb_walk_segment
++ * checks every address it is about to dereference against this, since a
++ * stale or torn CALL/JUMP target previously sent the walk into arbitrary
++ * host memory and crashed the process. */
 +static int pb_va_ok(uint32_t va)
 +{
 +    if (va < XBOX_CONTIG_SIZE - 4u)
@@ -1914,10 +2256,16 @@ index e3a16e2..1d65703 100644
 +    return va >= XBOX_CONTIG_BASE && va - XBOX_CONTIG_BASE < XBOX_CONTIG_SIZE - 4u;
 +}
 +
++/* Walks one segment (a JUMP target or the top-level ring) between va and
++ * end_va, dispatching methods to nv2a_pb_exec_method and recursing one level
++ * into CALL targets. Returns early -- dropping the rest of the segment -- if
++ * the walk would read outside guest RAM (pb_va_ok), logging the first 8
++ * occurrences; the title is never meant to point a CALL/JUMP there, so this
++ * is a corrupt or torn command word, not a place worth reading further. */
  static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                                  uint32_t *jumps, uint32_t *unknown)
  {
-@@ -473,7 +516,14 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+@@ -473,7 +557,14 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
      uint32_t words = 0;
  
      while (va < end_va && words < 0x100000u) {
@@ -1933,7 +2281,7 @@ index e3a16e2..1d65703 100644
          va += 4;
          words++;
  
-@@ -508,7 +558,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+@@ -508,7 +599,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
              uint32_t method =  w & 0x1FFCu;
              int noninc = (w & 0xE0000000u) == 0x40000000u;
  
@@ -1942,13 +2290,18 @@ index e3a16e2..1d65703 100644
                  uint32_t m = noninc ? method : method + i * 4;
                  note(subch, m);
                  if (s_exec_enabled)
-@@ -524,7 +574,26 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+@@ -524,7 +615,35 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
      return words;
  }
  
 +extern unsigned long long xbox_HostNowNs(void);
 +static unsigned long long s_exec_busy_ns, s_exec_last_rep, s_exec_segs;
 +void nv2a_pb_scan_segment_timed(uint32_t start_va, uint32_t end_va);
++/* Times nv2a_pb_scan_segment_timed (the original segment-scan body, renamed)
++ * and accumulates how much of each 10 s window the executor spent inside it,
++ * printed as an [EXEC] line: the segment scan is the default walk
++ * (RECOMP_PB_WALK unset or != dma), so this is how its CPU cost is seen
++ * without a separate profiler. */
  void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
 +{
 +    unsigned long long t0 = xbox_HostNowNs(), t1;
@@ -1965,19 +2318,28 @@ index e3a16e2..1d65703 100644
 +    }
 +}
 +
++/* The segment-scan walk's actual body (see nv2a_pb_scan_segment for the
++ * timing wrapper call sites use): walks the bytes between a title's last
++ * flush point and the new PUT, once per flush, without following JUMP/CALL
++ * across flushes the way the DMA walk does. */
 +void nv2a_pb_scan_segment_timed(uint32_t start_va, uint32_t end_va)
  {
      uint32_t words, jumps = 0, unknown = 0;
  
 diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
-index c1b48e4..bf9b25f 100644
+index c1b48e4..ae82205 100644
 --- a/src/kernel/nv2a_vsh_interp.c
 +++ b/src/kernel/nv2a_vsh_interp.c
-@@ -430,3 +430,23 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+@@ -430,3 +430,33 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
      }
      return 0;
  }
 +
++/* For a GPU back end that runs the program itself (draw_vsh, nv2a_backend.h):
++ * the instruction words from the program's start slot through the one
++ * carrying the "final" flag (nv2a_vsh_run stops there too). Returns the
++ * instruction count (4 words each), or 0 if no instruction in range is
++ * terminated -- the title has not finished uploading a program yet. */
 +uint32_t nv2a_vsh_program_words(const uint32_t **words)
 +{
 +    uint32_t s;
@@ -1988,11 +2350,16 @@ index c1b48e4..bf9b25f 100644
 +    return 0;
 +}
 +
++/* The 192 x vec4 constant bank backing c[] reads, for a GPU back end to
++ * upload verbatim instead of resolving c[] itself. */
 +const float *nv2a_vsh_constants(void)
 +{
 +    return &s_const[0][0];
 +}
 +
++/* Whether the current program writes to c[] (CXT_WRITE): a GPU copy of the
++ * program cannot update the constant bank the way the CPU interpreter does,
++ * so backend_vsh_batch falls back to the CPU path when this is set. */
 +int nv2a_vsh_cxt_write(void)
 +{
 +    return s_cxt_write != 0;
@@ -2017,10 +2384,39 @@ index 8acb0af..5cab2d7 100644
  void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
  const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index b723a92..1f46cb7 100644
+index b723a92..3de5327 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
-@@ -1502,8 +1502,14 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -10,6 +10,15 @@
+  * 2. Copy .rdata and initialized .data from the XBE
+  * 3. Zero-fill the BSS region
+  * 4. Set memory protection (read-only for .rdata)
++ *
++ * Project additions in this file:
++ *   - nv2a_ack_thread drives the pushbuffer DMA walk forward (resuming a
++ *     segment whose flip hold has released, or that still has unconsumed
++ *     work even though PUT did not move) instead of only reacting to PUT.
++ *   - xbox_PhysNoteImageName / xbox_PhysImageNamed track physical numbers
++ *     that landed inside the loaded XBE image, alongside the existing RAM
++ *     map, so a device model can tell a title's own statics from a window
++ *     block when both occupy the same number range.
+  */
+ 
+ #if !defined(_WIN32) && !defined(_GNU_SOURCE)
+@@ -1436,6 +1445,12 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
+     return (volatile uint32_t *)((char *)g_nv2a_memory + offset);
+ }
+ 
++/* Background thread that keeps PGRAPH's idle/busy bits moving and drives the
++ * pushbuffer DMA walk forward: polls the flip hold (nv2a_pb_exec_flip_poll),
++ * then resumes the walk once its segment's hold releases or PUT has moved,
++ * publishing the walk's own GET (nv2a_pb_dma_get) rather than always jumping
++ * straight to PUT, so a held FLIP_STALL is not skipped over. Runs until
++ * g_nv2a_ack_stop is set; started by xbox_Nv2aAckStart. */
+ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+ {
+     volatile uint32_t *regs = (volatile uint32_t *)param;
+@@ -1502,8 +1517,14 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
              static uint32_t get_written = 0xFFFFFFFFu;  /* GET as we last left it */
              DWORD now_ms = GetTickCount();
              uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
@@ -2036,7 +2432,7 @@ index b723a92..1f46cb7 100644
                  /* Survey the segment the title just submitted, once. */
                  {
                      extern void nv2a_pb_scan(uint32_t);
-@@ -1539,7 +1545,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -1539,7 +1560,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                           * before it. */
                          if (get_written == 0xFFFFFFFFu || get_now != get_written)
                              nv2a_pb_resync(get_now);
@@ -2045,7 +2441,7 @@ index b723a92..1f46cb7 100644
                              nv2a_pb_scan(put);
                      } else {
                          /* The segment scan, the default: the bytes between
-@@ -1587,8 +1593,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -1587,8 +1608,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      volatile uint32_t *get =
                          (volatile uint32_t *)((char *)regs
                                                + NV2A_USER_DMA_GET);
@@ -2059,7 +2455,7 @@ index b723a92..1f46cb7 100644
                  }
                  last_put = put; last_put_ms = now_ms;
                  /* GET as well as PUT. A title that stops submitting has either
-@@ -4371,6 +4380,25 @@ uint32_t xbox_ContiguousInUseBytes(void)
+@@ -4371,6 +4395,32 @@ uint32_t xbox_ContiguousInUseBytes(void)
   * most one pass of one voice. */
  static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
  
@@ -2071,12 +2467,19 @@ index b723a92..1f46cb7 100644
 + * XPP buffers). Image pages are never freed, so the record never clears. */
 +static volatile uint8_t g_phys_image_named[CONTIG_PAGES];
 +
++/* Marks a physical number MmGetPhysicalAddress handed back as one still
++ * inside the loaded XBE image (as opposed to the contiguous allocator's
++ * window); called from kernel_memory.c's xbox_MmGetPhysicalAddress for every
++ * address outside the contiguous window. No-op outside the image range. */
 +void xbox_PhysNoteImageName(uint32_t va)
 +{
 +    if (va >= g_xbox_image_lo && va < g_xbox_image_hi && va < XBOX_CONTIG_SIZE)
 +        g_phys_image_named[va / CONTIG_PAGE] = 1;
 +}
 +
++/* Whether a physical number was ever seen naming an image page (see
++ * xbox_PhysNoteImageName); a device model checks this to treat the number as
++ * a static buffer rather than a contiguous-allocator block. */
 +int xbox_PhysImageNamed(uint32_t pa)
 +{
 +    return pa < XBOX_CONTIG_SIZE && g_phys_image_named[pa / CONTIG_PAGE];
@@ -2086,24 +2489,28 @@ index b723a92..1f46cb7 100644
  {
      if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
 diff --git a/src/platform/CMakeLists.txt b/src/platform/CMakeLists.txt
-index 334a9ed..67aa407 100644
+index 334a9ed..cdbed93 100644
 --- a/src/platform/CMakeLists.txt
 +++ b/src/platform/CMakeLists.txt
-@@ -30,7 +30,7 @@ target_include_directories(recomp_exit_hook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+@@ -29,8 +29,10 @@ target_include_directories(recomp_exit_hook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+ 
  # host_time: the host's monotonic clock and the timer thread's sleep
  # (host_time.h). A real library on every host, carried by platform to every
- # library of the runtime.
+-# library of the runtime.
 -add_library(host_time STATIC host_time.c)
++# library of the runtime. perf_log.c (perf_log.h) is folded into the same
++# static library: it only needs host_time's clock, and every consumer of
++# host_time already links it, so this is the one place to add it project-wide.
 +add_library(host_time STATIC host_time.c perf_log.c)
  target_include_directories(host_time PUBLIC
      ${XBOXRECOMP_SRC_DIR}
      ${CMAKE_CURRENT_SOURCE_DIR}
 diff --git a/src/platform/perf_log.c b/src/platform/perf_log.c
 new file mode 100644
-index 0000000..66e0300
+index 0000000..ce88ac3
 --- /dev/null
 +++ b/src/platform/perf_log.c
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,490 @@
 +/*
 + * perf_log.c - see perf_log.h.
 + */
@@ -2156,6 +2563,8 @@ index 0000000..66e0300
 +
 +static double secs(uint64_t now) { return (double)(now - s_t0) / 1e9; }
 +
++/* Formats "HH:MM:SS t=SSSS.SSs" (wall clock, then seconds since xbox_PerfInit)
++ * into `b`, the prefix every log line carries. */
 +static void stamp(char *b, size_t n, uint64_t now)
 +{
 +    SYSTEMTIME st;
@@ -2164,6 +2573,9 @@ index 0000000..66e0300
 +                st.wSecond, secs(now));
 +}
 +
++/* Writes one timestamped, flushed line to the log file. Caller already holds
++ * s_cs (the name says so because line() below is the version that takes it);
++ * a no-op if the log was never opened. */
 +static void line_locked(uint64_t now, const char *fmt, va_list ap)
 +{
 +    char ts[48];
@@ -2176,6 +2588,8 @@ index 0000000..66e0300
 +    fflush(s_f);
 +}
 +
++/* line_locked, taking s_cs itself: the convenience form for call sites that
++ * are not already inside the critical section (most of them). */
 +static void line(uint64_t now, const char *fmt, ...)
 +{
 +    va_list ap;
@@ -2184,6 +2598,9 @@ index 0000000..66e0300
 +    va_end(ap);
 +}
 +
++/* Reads one REG_SZ value into `out` (empty string on any failure: a missing
++ * key must never stop the header from being written). Used for the OS name,
++ * build number and CPU name shown at the top of the log. */
 +static void reg_string(HKEY root, const char *key, const char *val, char *out, DWORD n)
 +{
 +    HKEY h;
@@ -2199,6 +2616,10 @@ index 0000000..66e0300
 +    }
 +}
 +
++/* Writes the one-time banner: date, exe path, OS/CPU/memory from the
++ * registry and GlobalMemoryStatusEx, every RECOMP_ or HITZ_ environment
++ * variable in effect (so a sent log says what was run), and the "how to
++ * read this" key. Called once, under s_cs, right after the file opens. */
 +static void header(void)
 +{
 +    char cpu[128], prod[128], build[32], exe[MAX_PATH];
@@ -2245,6 +2666,11 @@ index 0000000..66e0300
 +    fflush(s_f);
 +}
 +
++/* Decides whether the log is on (RECOMP_PERF_LOG=1), opens
++ * RECOMP_PERF_LOG_FILE (default "perf.log") and writes the header.
++ * InterlockedCompareExchange on s_state makes this safe if two threads race
++ * to the first xbox_PerfEnabled: only one opens the file. Leaves s_state at
++ * -1 (off) if the variable is unset/0 or the file could not be opened. */
 +void xbox_PerfInit(void)
 +{
 +    const char *e, *name;
@@ -2269,6 +2695,9 @@ index 0000000..66e0300
 +    InterlockedExchange(&s_state, 1);
 +}
 +
++/* Lazily runs xbox_PerfInit on first use, then reports whether the log is
++ * open. Every other xbox_Perf* function calls this first and returns at once
++ * if it is false, so the log costs nothing while off. */
 +int xbox_PerfEnabled(void)
 +{
 +    if (s_state == 0)
@@ -2276,6 +2705,9 @@ index 0000000..66e0300
 +    return s_state > 0;
 +}
 +
++/* Public: a free-form timestamped line (see perf_log.h). Used for slow
++ * kernel calls, the display-lock state and anything else that does not fit
++ * the frame-counter model. */
 +void xbox_PerfNote(const char *fmt, ...)
 +{
 +    va_list ap;
@@ -2288,6 +2720,8 @@ index 0000000..66e0300
 +    LeaveCriticalSection(&s_cs);
 +}
 +
++/* Accumulates into one of the XBOX_PERF_* per-frame counters; read back and
++ * reset by xbox_PerfFlip. */
 +void xbox_PerfCount(int counter, double amount)
 +{
 +    if (counter < 0 || counter >= XBOX_PERF_COUNTERS || !xbox_PerfEnabled())
@@ -2297,6 +2731,9 @@ index 0000000..66e0300
 +    LeaveCriticalSection(&s_cs);
 +}
 +
++/* Records that a game file was opened during the frame in progress, kept
++ * (up to FILES_KEPT, the tail of long paths) so a HITCH line can say what
++ * was loading when the stutter happened; dropped ones are just counted. */
 +void xbox_PerfFile(const char *path)
 +{
 +    const char *p;
@@ -2313,6 +2750,9 @@ index 0000000..66e0300
 +    LeaveCriticalSection(&s_cs);
 +}
 +
++/* Median of the last RECENT frame times: the hitch rule's baseline. Median
++ * rather than mean so a game that legitimately runs at a lower, steady frame
++ * rate (a menu capped at 30, say) is not itself flagged as one long hitch. */
 +static double median_recent(void)
 +{
 +    double v[RECENT];
@@ -2328,6 +2768,10 @@ index 0000000..66e0300
 +    return n ? v[n / 2] : 0.0;
 +}
 +
++/* Writes the periodic summary line (fps, frame-time range, hitch count,
++ * display state, shader/texture counts, per-category ms/frame) and resets
++ * the summary-period accumulators (s_per) for the next SUMMARY_NS window.
++ * Caller holds s_cs. */
 +static void summary_locked(uint64_t now)
 +{
 +    double sec = (double)(now - s_per.start) / 1e9;
@@ -2367,6 +2811,11 @@ index 0000000..66e0300
 +    s_per.min_ms = 1e9;
 +}
 +
++/* Marks the end of one game frame (the title flipped). Computes this frame's
++ * duration from the previous call, rolls it into the recent-frame window and
++ * the summary-period stats, emits a HITCH line if it is clearly longer than
++ * the recent median and over 25 ms, and resets the per-frame counters and
++ * file list for the next frame. Call once per title flip. */
 +void xbox_PerfFlip(void)
 +{
 +    uint64_t now;
@@ -2446,6 +2895,9 @@ index 0000000..66e0300
 +    LeaveCriticalSection(&s_cs);
 +}
 +
++/* Reports, from the presenter, how many display refreshes the previous frame
++ * stayed on screen; a JUDDER line (up to 5 per summary period) is written
++ * when that differs from the steady `expected` count. */
 +void xbox_PerfShown(uint32_t refreshes, uint32_t expected)
 +{
 +    if (!xbox_PerfEnabled() || !refreshes)
@@ -2462,6 +2914,10 @@ index 0000000..66e0300
 +    LeaveCriticalSection(&s_cs);
 +}
 +
++/* Updates the display state shown in summaries (refresh rate, whether the
++ * frame clock is locked to it, the lock's phase error, the presenter's own
++ * description); logs a line only when something actually changed, so this
++ * can be called every frame without flooding the log. */
 +void xbox_PerfDisplay(double hz, int locked, int every, double phase_err_ms,
 +                      const char *presenter)
 +{
@@ -2483,6 +2939,9 @@ index 0000000..66e0300
 +    LeaveCriticalSection(&s_cs);
 +}
 +
++/* F9 handler: writes a numbered MARK line with the current frame stats, so
++ * a moment reported as "it stuttered just now" can be found later. Returns
++ * the mark number (shown in the window title), 0 if the log is off. */
 +int xbox_PerfMark(void)
 +{
 +    int n;
@@ -2500,6 +2959,9 @@ index 0000000..66e0300
 +    return n;
 +}
 +
++/* Flushes the last summary, writes the closing "end" line with the run's
++ * totals and closes the file. `why` names the reason (exit, a crash handler,
++ * ...). Does nothing if the log was never opened. */
 +void xbox_PerfShutdown(const char *why)
 +{
 +    if (s_state <= 0)
@@ -2527,8 +2989,12 @@ index 0000000..66e0300
 +void xbox_PerfNote(const char *fmt, ...) { (void)fmt; }
 +void xbox_PerfCount(int counter, double amount) { (void)counter; (void)amount; }
 +void xbox_PerfFile(const char *path) { (void)path; }
++/* No-op stand-ins so every other platform links without an #ifdef at each
++ * call site; perf_log.c's real logging is Windows-only (registry queries,
++ * SYSTEMTIME, the CRITICAL_SECTION). */
 +void xbox_PerfFlip(void) {}
 +void xbox_PerfShown(uint32_t refreshes, uint32_t expected) { (void)refreshes; (void)expected; }
++/* See xbox_PerfDisplay above; non-Windows hosts just discard the report. */
 +void xbox_PerfDisplay(double hz, int locked, int every, double phase_err_ms, const char *presenter)
 +{ (void)hz; (void)locked; (void)every; (void)phase_err_ms; (void)presenter; }
 +int  xbox_PerfMark(void) { return 0; }
@@ -2537,10 +3003,10 @@ index 0000000..66e0300
 +#endif
 diff --git a/src/platform/perf_log.h b/src/platform/perf_log.h
 new file mode 100644
-index 0000000..1eb7669
+index 0000000..6208779
 --- /dev/null
 +++ b/src/platform/perf_log.h
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,86 @@
 +/*
 + * perf_log.h - a human-readable timing log for chasing stutter.
 + *
@@ -2587,14 +3053,24 @@ index 0000000..1eb7669
 +    XBOX_PERF_COUNTERS
 +};
 +
++/* Opens RECOMP_PERF_LOG_FILE and writes the header if RECOMP_PERF_LOG=1;
++ * a no-op (the log stays off) otherwise. Safe to call more than once: only
++ * the first call decides. Called lazily by xbox_PerfEnabled, so nothing
++ * needs to call it explicitly before logging. */
 +void xbox_PerfInit(void);
++/* Whether the log is open. Also the gate every other xbox_Perf* call checks
++ * first, so callers never need to test RECOMP_PERF_LOG themselves. */
 +int  xbox_PerfEnabled(void);
 +/* A free-form line, prefixed with the time. */
 +void xbox_PerfNote(const char *fmt, ...);
++/* Adds to a per-frame counter (see the XBOX_PERF_* enum); folded into the
++ * HITCH line and the 5 s summary at the next xbox_PerfFlip. */
 +void xbox_PerfCount(int counter, double amount);
 +/* A game file was opened (shown on a hitch that happened during it). */
 +void xbox_PerfFile(const char *path);
-+/* The title flipped: one game frame ended. */
++/* The title flipped: one game frame ended. Computes the frame's duration
++ * from the previous flip, decides whether it was a hitch, and resets the
++ * per-frame counters and file list for the next frame. */
 +void xbox_PerfFlip(void);
 +/* The presenter's view: the previous frame stayed on screen for `refreshes`
 + * display refreshes; `expected` is the steady value (0 when there is none,
@@ -2607,6 +3083,9 @@ index 0000000..1eb7669
 +                      const char *presenter);
 +/* F9: returns the mark's number (shown in the window title), 0 when off. */
 +int  xbox_PerfMark(void);
++/* Writes the final summary and an "end" line, then closes the log. `why` is
++ * the reason shown on that line (e.g. "exit", a crash). Safe to call once
++ * the log was never opened (does nothing). */
 +void xbox_PerfShutdown(const char *why);
 +
 +#ifdef __cplusplus
@@ -2615,10 +3094,10 @@ index 0000000..1eb7669
 +
 +#endif
 diff --git a/src/usb/ohci.c b/src/usb/ohci.c
-index efa5046..16f2a17 100644
+index efa5046..a168d14 100644
 --- a/src/usb/ohci.c
 +++ b/src/usb/ohci.c
-@@ -511,23 +511,50 @@ static int guest_ok(uint32_t va, uint32_t bytes)
+@@ -511,23 +511,54 @@ static int guest_ok(uint32_t va, uint32_t bytes)
   * again, forever. */
  static uint32_t bus_resolve(uint32_t addr)
  {
@@ -2640,6 +3119,7 @@ index efa5046..16f2a17 100644
      return addr;
  }
  
++extern const volatile uint8_t *xbox_ContiguousPageMap(void);
 +/* Descriptor pointers (HCCA, ED and TD links) are always DMA memory: XAPI
 + * builds them in MmAllocateContiguousMemory. This runtime's contiguous
 + * allocator hands out physical numbers from 0x1000 up, so with a large XBE
@@ -2649,7 +3129,6 @@ index efa5046..16f2a17 100644
 + * port reset. A page that is currently allocated in the window is the
 + * window. Data buffers keep bus_resolve: they can be image statics
 + * (Burnout 3). */
-+extern const volatile uint8_t *xbox_ContiguousPageMap(void);
 +static uint32_t bus_resolve_desc(uint32_t addr)
 +{
 +    const volatile uint8_t *map = xbox_ContiguousPageMap();
@@ -2658,6 +3137,9 @@ index efa5046..16f2a17 100644
 +    return bus_resolve(addr);
 +}
 +
++/* Reads a guest 32-bit word at a descriptor/HCCA bus address (bus_resolve_desc
++ * routes a window block there even if its physical number falls in the XBE
++ * image range); 0 if the resolved address is not readable. */
  static uint32_t rd32(uint32_t va)
  {
 -    va = bus_resolve(va);
@@ -2666,6 +3148,7 @@ index efa5046..16f2a17 100644
          return 0;
      return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
  }
++/* Writes a guest 32-bit word at a descriptor/HCCA bus address; see rd32. */
  static void wr32(uint32_t va, uint32_t v)
  {
 -    va = bus_resolve(va);
@@ -2674,11 +3157,18 @@ index efa5046..16f2a17 100644
          return;
      *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
 diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
-index bd00f3f..5f92255 100644
+index bd00f3f..46478b1 100644
 --- a/src/usb/usb_gamepad.c
 +++ b/src/usb/usb_gamepad.c
-@@ -558,6 +558,17 @@ static void pad_script_apply(int pad, uint8_t *out)
+@@ -556,8 +556,24 @@ static void pad_script_apply(int pad, uint8_t *out)
+     }
+ }
  
++/* Builds one HID gamepad report for the pad's current host input state
++ * (pad_script_apply overrides are applied by the caller first); also logs
++ * the first report seen for each of the first 4 pads and any report
++ * requested for a pad index the USB layer never assigned, which catches a
++ * descriptor/address mismatch early. */
  int usb_gamepad_report(int pad, uint8_t *out, int max)
  {
 +    {
@@ -2696,7 +3186,7 @@ index bd00f3f..5f92255 100644
      const XBOX_GAMEPAD *g;
      uint8_t synth = synthetic_buttons();
 diff --git a/src/video/fb_present.c b/src/video/fb_present.c
-index 3430107..1ed06c8 100644
+index 3430107..e9ba801 100644
 --- a/src/video/fb_present.c
 +++ b/src/video/fb_present.c
 @@ -17,7 +17,7 @@
@@ -2748,7 +3238,7 @@ index 3430107..1ed06c8 100644
      if (!s_present[next]) {
          s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
                                               4);
-@@ -198,22 +212,28 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+@@ -198,22 +212,31 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
      }
      /* Published only once it is whole. */
      InterlockedExchange(&s_present_idx, next);
@@ -2765,6 +3255,9 @@ index 3430107..1ed06c8 100644
  static volatile LONG s_flips;
  static volatile LONG s_frame_draws;
  
++/* Copies the title string (max_chars UTF-16 code units) into s_title under
++ * the SRW lock, so the window thread never reads a title half-written by a
++ * flip on another thread. */
  void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
  {
      int i;
@@ -2777,7 +3270,7 @@ index 3430107..1ed06c8 100644
  }
  
  void xbox_FramebufferWindowFrameStats(uint32_t draws)
-@@ -225,9 +245,10 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
+@@ -225,9 +248,10 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
  /* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
   * (DXGI's own Alt+Enter, exclusive mode at the frame's 640x480, is off --
   * gpu_present.c; both presenters letterbox to any size.) */
@@ -2789,7 +3282,7 @@ index 3430107..1ed06c8 100644
      static RECT saved;
      static LONG_PTR saved_style;
      if (!full) {
-@@ -242,12 +263,17 @@ static void fb_toggle_fullscreen(HWND h)
+@@ -242,14 +266,24 @@ static void fb_toggle_fullscreen(HWND h)
                       mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
                       SWP_FRAMECHANGED | SWP_SHOWWINDOW);
          full = 1;
@@ -2806,8 +3299,15 @@ index 3430107..1ed06c8 100644
 +#undef full
  }
  
++/* The framebuffer window's message handler: key/mouse events into the shared
++ * key table for src/input, F11/Alt+Enter and Esc for borderless fullscreen,
++ * F9 for a performance-log mark, WM_SIZE to flag a resize for the present
++ * loop, and WM_CLOSE/WM_DESTROY to end the whole process (see the comment
++ * at that case). Runs on the window thread (fb_thread). */
  static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
-@@ -261,6 +287,24 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+ {
+     /* First press only (bit 30: the key was already down), and with Alt held
+@@ -261,6 +295,24 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
      }
      if (m == WM_SYSKEYDOWN && w == VK_RETURN)
          return 0;                       /* auto-repeat of Alt+Enter */
@@ -2832,7 +3332,7 @@ index 3430107..1ed06c8 100644
      switch (m) {
      case WM_CLOSE:
      case WM_DESTROY:
-@@ -275,6 +319,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+@@ -275,6 +327,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
          InterlockedExchange(&s_fb_running, 0);
          if (!getenv("RECOMP_CLOSE_KEEPS_RUNNING")) {
              fprintf(stderr, "  [FBWIN] window closed: exiting\n");
@@ -2840,7 +3340,22 @@ index 3430107..1ed06c8 100644
              recomp_exit_hook_run("window");
              fflush(stdout);
              fflush(stderr);
-@@ -543,24 +588,48 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -472,6 +525,14 @@ static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+     return 0;
+ }
+ 
++/* Creates the window and runs its message/present loop until
++ * xbox_FramebufferWindowStart's thread is asked to stop (s_fb_running, the
++ * window closing, or a fatal CreateWindow failure). Paces itself to the
++ * display when the D3D11 presenter is active and waiting on s_new_frame
++ * (see the comment at that wait), else sleeps 16 ms per iteration; GDI
++ * presents are unpaced so the fixed sleep is the only pacing then. Shuts
++ * the presenter down and frees its buffers on exit. The sole thread that
++ * owns the window and reads/writes s_rgb outside the flip's copy. */
+ static DWORD WINAPI fb_thread(LPVOID unused)
+ {
+     HWND hwnd;
+@@ -543,24 +604,48 @@ static DWORD WINAPI fb_thread(LPVOID unused)
  
      fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
              s_fb_width, s_fb_height);
@@ -2893,7 +3408,7 @@ index 3430107..1ed06c8 100644
              if (!fb_pinned)
                  fb_overlay();
              paced = fb_show(hwnd, hdc, &bi);
-@@ -601,13 +670,23 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -601,13 +686,23 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              static DWORD t0;
              static LONG f0;
              DWORD now = GetTickCount();
@@ -2919,7 +3434,18 @@ index 3430107..1ed06c8 100644
                  SetWindowTextW(hwnd, tb);
                  t0 = now; f0 = f;
              }
-@@ -634,6 +713,9 @@ void xbox_FramebufferWindowStart(void)
+@@ -626,6 +721,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+     return 0;
+ }
+ 
++/* Starts the framebuffer window thread once, if RECOMP_FB_WINDOW is set;
++ * later calls are no-ops while it is running. Brings up the performance log
++ * and the flip-notification event before the thread so fb_thread never
++ * races their creation. */
+ void xbox_FramebufferWindowStart(void)
+ {
+     HANDLE th;
+@@ -634,6 +733,9 @@ void xbox_FramebufferWindowStart(void)
          return;
      if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
          return;
@@ -2930,7 +3456,7 @@ index 3430107..1ed06c8 100644
      if (th)
          CloseHandle(th);
 diff --git a/src/video/gpu_present.c b/src/video/gpu_present.c
-index 4e122b1..960ba0d 100644
+index 4e122b1..bcdcffa 100644
 --- a/src/video/gpu_present.c
 +++ b/src/video/gpu_present.c
 @@ -3,11 +3,31 @@
@@ -3005,10 +3531,12 @@ index 4e122b1..960ba0d 100644
  
  /* A triangle covering the viewport, from the vertex id; uv 0..1. */
  static const char s_hlsl[] =
-@@ -58,6 +91,12 @@ int gpu_present_enabled(void)
+@@ -58,6 +91,14 @@ int gpu_present_enabled(void)
      return on;
  }
  
++/* True when the environment variable is unset to a falsy/off value
++ * ("0", "off", or "timer" for RECOMP_PACING's own vocabulary). */
 +static int env_off(const char *name)
 +{
 +    const char *e = getenv(name);
@@ -3018,7 +3546,7 @@ index 4e122b1..960ba0d 100644
  static void client_size(uint32_t *w, uint32_t *h)
  {
      RECT r;
-@@ -92,9 +131,254 @@ static ID3DBlob *compile(const char *entry, const char *target)
+@@ -92,9 +133,279 @@ static ID3DBlob *compile(const char *entry, const char *target)
      return code;
  }
  
@@ -3080,6 +3608,14 @@ index 4e122b1..960ba0d 100644
 +    return (hz / n > 59.4 && hz / n < 60.6) ? n : 0;
 +}
 +
++/* Runs for the presenter's whole life while vsync is on: watches the
++ * window's monitor's real vblanks (IDXGIOutput::WaitForVBlank), estimates
++ * its refresh period from them, and while it is stable and a 60 Hz multiple
++ * reports the lock to xbox_VblankDiscipline (kernel_bridge.c) so the game's
++ * frame clock steers onto it; reports no lock when the display is not a
++ * 60 Hz multiple, is unstable, or RECOMP_PACING=timer. Also feeds
++ * xbox_PerfDisplay for the performance log, about once a second. Raises its
++ * own priority since a late report here directly shows up as judder. */
 +static DWORD WINAPI clock_thread(LPVOID unused)
 +{
 +    IDXGIOutput *out = NULL;
@@ -3171,6 +3707,10 @@ index 4e122b1..960ba0d 100644
 +    return 0;
 +}
 +
++/* Refreshes each game frame should stay on screen while the display clock is
++ * locked (set by clock_thread); 0 when it is not locked (no steady value to
++ * expect). Read by fb_present.c's performance-log frame_stats and by code
++ * that wants to know the expected judder-free cadence. */
 +int gpu_present_expected_refreshes(void)
 +{
 +    return (int)s_lock_every;
@@ -3181,6 +3721,14 @@ index 4e122b1..960ba0d 100644
 +static int     s_switched;
 +static wchar_t s_switched_dev[CCHDEVICENAME];
 +
++/* Entering (full=1) or leaving (full=0) borderless fullscreen: on leaving,
++ * restores any refresh rate this switched; on entering, if
++ * RECOMP_REFRESH_SWITCH=1 and the display is not already a 60 Hz multiple,
++ * finds the highest 60 Hz multiple available at the current resolution and
++ * switches to it with CDS_FULLSCREEN (temporary -- Windows reverts it if the
++ * process exits without calling this again). No-op if already switched or
++ * the display already locks. Called from fb_present.c's fullscreen toggle
++ * and from gpu_present_shutdown. */
 +void gpu_present_fullscreen(int full)
 +{
 +    MONITORINFOEXW mi;
@@ -3269,12 +3817,17 @@ index 4e122b1..960ba0d 100644
 +                                         &s_chain, &s_dev, NULL, &s_ctx);
 +}
 +
++/* Brings up the D3D11 device, swap chain, frame texture and present shaders
++ * for hwnd; tries the flip-model swap chain first (RECOMP_FLIP_MODEL=0
++ * forces the blit model), falling back to the blit model if that fails, and
++ * to GDI (return 0) if both fail. Starts the display-clock thread when
++ * vsync is on. Returns 1 once D3D11 is ready to present. */
 +int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
 +{
      D3D11_TEXTURE2D_DESC td;
      D3D11_SAMPLER_DESC smp;
      ID3DBlob *vsb, *psb;
-@@ -106,20 +390,19 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
+@@ -106,20 +417,19 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
      s_hwnd = hwnd;
      s_w = width; s_h = height;
      client_size(&s_bw, &s_bh);
@@ -3307,7 +3860,7 @@ index 4e122b1..960ba0d 100644
      if (FAILED(hr)) {
          fprintf(stderr, "  [D3D] device/swap chain failed (0x%08lX); staying on GDI\n",
                  (unsigned long)hr);
-@@ -130,10 +413,26 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
+@@ -130,10 +440,26 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
           * not DXGI's exclusive mode at 640x480. */
          IDXGIFactory *fac = NULL;
          if (SUCCEEDED(IDXGISwapChain_GetParent(s_chain, &IID_IDXGIFactory, (void **)&fac))) {
@@ -3334,7 +3887,7 @@ index 4e122b1..960ba0d 100644
      ZeroMemory(&td, sizeof td);
      td.Width = width; td.Height = height; td.MipLevels = 1; td.ArraySize = 1;
      td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
-@@ -161,12 +460,44 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
+@@ -161,12 +487,44 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
      }
      ID3D10Blob_Release(vsb);
      ID3D10Blob_Release(psb);
@@ -3381,7 +3934,7 @@ index 4e122b1..960ba0d 100644
  /* Returns 0 when nothing was shown: the window is occluded or the display
   * is off, and Present does not wait for vsync then -- the caller must pace
   * itself instead of spinning. The pixels are read before this returns. */
-@@ -176,6 +507,7 @@ int gpu_present_frame(const uint32_t *pixels)
+@@ -176,6 +534,7 @@ int gpu_present_frame(const uint32_t *pixels)
      D3D11_VIEWPORT vp;
      uint32_t cw, ch;
      float sx, sy;
@@ -3389,7 +3942,7 @@ index 4e122b1..960ba0d 100644
  
      if (!s_rtv || !pixels)
          return 0;
-@@ -192,6 +524,7 @@ int gpu_present_frame(const uint32_t *pixels)
+@@ -192,6 +551,7 @@ int gpu_present_frame(const uint32_t *pixels)
      }
      ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_frame, 0, NULL,
                                            pixels, s_w * 4, 0);
@@ -3397,7 +3950,7 @@ index 4e122b1..960ba0d 100644
      ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
      ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, black);
      /* The largest rectangle of the frame's shape that fits, centred. */
-@@ -212,11 +545,31 @@ int gpu_present_frame(const uint32_t *pixels)
+@@ -212,11 +572,36 @@ int gpu_present_frame(const uint32_t *pixels)
      ID3D11DeviceContext_Draw(s_ctx, 3, 0);
      /* Paced only when Present waited for the vblank: with RECOMP_PRESENT_VSYNC=0
       * the caller keeps its own 16 ms sleep instead of spinning a core. */
@@ -3408,16 +3961,21 @@ index 4e122b1..960ba0d 100644
 +    return hr == S_OK && s_vsync;
 +}
 +
++/* Whether the D3D11 presenter is up (a render target view exists). */
 +int gpu_present_active(void)
 +{
 +    return s_rtv != NULL;
 +}
 +
++/* Whether gpu_present_init ended up with a flip-model swap chain rather
++ * than the blit-model fallback. */
 +int gpu_present_flip_model(void)
 +{
 +    return s_flip;
  }
  
++/* Stops the display-clock thread (if running), restores any refresh switch,
++ * and releases every D3D11/DXGI object gpu_present_init created. */
  void gpu_present_shutdown(void)
  {
 +    if (s_clock_thread) {
@@ -3430,7 +3988,7 @@ index 4e122b1..960ba0d 100644
      if (s_ps)    { ID3D11PixelShader_Release(s_ps);           s_ps = NULL; }
      if (s_vs)    { ID3D11VertexShader_Release(s_vs);          s_vs = NULL; }
      if (s_samp)  { ID3D11SamplerState_Release(s_samp);        s_samp = NULL; }
-@@ -227,9 +580,4 @@ void gpu_present_shutdown(void)
+@@ -227,9 +612,4 @@ void gpu_present_shutdown(void)
      if (s_ctx)   { ID3D11DeviceContext_Release(s_ctx);        s_ctx = NULL; }
      if (s_dev)   { ID3D11Device_Release(s_dev);               s_dev = NULL; }
  }
@@ -3457,11 +4015,19 @@ index 4e14e91..f58d21a 100644
  #endif
  #endif
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index 775612f..c69c950 100644
+index 775612f..eab5692 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
-@@ -1947,6 +1947,14 @@ class Lifter:
+@@ -1945,8 +1945,22 @@ class Lifter:
+     # ── MOV family ──
+ 
      def _lift_mov(self, insn, ops):
++        """Lift x86 MOV into an assignment between the lifted C operands.
++
++        Debug/control-register operands (mov drN/crN, ...) have no meaning on
++        a recompiled host and are neutralised instead of lifted literally:
++        a write becomes a no-op comment, a read yields the constant 0.
++        """
          if nops := len(ops) < 2:
              return [f"/* mov: bad operands */"]
 +        # Debug/control registers (mov drN/crN) have no meaning on a recomp

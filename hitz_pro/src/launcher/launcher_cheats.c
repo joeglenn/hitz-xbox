@@ -1,10 +1,36 @@
 /* The game's built-in cheats in the launcher. See launcher_cheats.h and
- * src/cheats.h (what each cheat does, where the game keeps it). */
+ * src/cheats.h (what each cheat does, where the game keeps it).
+ *
+ * This module owns the state of the 5 game cheats (k_cheats[]) and the
+ * small modal "Cheats" dialog that lets the player choose them, separately
+ * from hitz_launcher.c's g_settings table because a cheat's value space
+ * (up to 12 choices including "Game setting") does not fit the launcher's
+ * fixed boolean/ini-enum SettingDef shape, and because the cheats button
+ * and dialog are self-contained enough to live in their own file.
+ *
+ * Persistence: each cheat is one ini key (cheat_*) in the same
+ * hitz_settings.ini as the rest of the settings, loaded/saved by
+ * hitz_launcher.c calling Cheats_Load/Cheats_Save alongside its own
+ * LoadSettings/SaveSettings.
+ *
+ * Environment variables: each active (non "Game setting") cheat becomes one
+ * HITZ_CHEAT_* variable for the child game process, built through
+ * Cheats_Env and folded into hitz_launcher.c's BuildEnvList.
+ *
+ * Threading: single-threaded, UI thread only. Cheats_ShowDialog runs its
+ * own local GetMessageW loop while the dialog is open (disabling the owner
+ * window, like a classic Win32 modal dialog), returning only once the
+ * dialog is destroyed. */
 #include <windows.h>
 #include <strsafe.h>
 
 #include "launcher_cheats.h"
 
+/* One row of the cheat table: ini/env names, the label shown in the
+ * launcher, the number of choices (including "Game setting" as choice 0),
+ * the ini/env value and display text for each choice, and the code the
+ * player would otherwise type into the game's own Cheats menu. count is
+ * always <= ARRAYSIZE(values)/ARRAYSIZE(display) (12). */
 typedef struct {
     LPCWSTR ini_key;
     LPCWSTR env_name;
@@ -35,8 +61,12 @@ static const CheatDef k_cheats[CHEATS_ENV_COUNT] = {
 };
 
 static const wchar_t k_section[] = L"settings";       /* hitz_settings.ini, as the launcher */
+/* Currently selected choice per cheat, index into k_cheats[i].values/display;
+ * 0 always means "Game setting" (leave it to the game's own Cheats menu). */
 static int s_sel[CHEATS_ENV_COUNT];          /* index into values; 0 = game */
 
+/* Returns the index of v within d->values (case-insensitive), or 0 ("game")
+ * if v does not match any known choice, e.g. an ini edited by hand. */
 static int FindValue(const CheatDef *d, LPCWSTR v)
 {
     for (int j = 0; j < d->count; j++) {
@@ -47,6 +77,9 @@ static int FindValue(const CheatDef *d, LPCWSTR v)
     return 0;
 }
 
+/* Loads every cheat's selection from the ini file at iniPath into s_sel,
+ * defaulting to "game" (index 0) for a missing key or an unrecognised
+ * value. Called by hitz_launcher.c's LoadSettings. */
 void Cheats_Load(LPCWSTR iniPath)
 {
     for (int i = 0; i < CHEATS_ENV_COUNT; i++) {
@@ -56,6 +89,10 @@ void Cheats_Load(LPCWSTR iniPath)
     }
 }
 
+/* Writes every cheat's current selection (s_sel) back to the ini file at
+ * iniPath. Called by hitz_launcher.c's SaveSettings, and directly from
+ * WndProc right after a successful Cheats_ShowDialog so the choice is not
+ * lost if the player then quits without pressing Play/Quit again. */
 void Cheats_Save(LPCWSTR iniPath)
 {
     for (int i = 0; i < CHEATS_ENV_COUNT; i++) {
@@ -63,6 +100,8 @@ void Cheats_Save(LPCWSTR iniPath)
     }
 }
 
+/* Returns TRUE if key is one of the 5 cheat_* ini keys, so hitz_launcher.c's
+ * --set command-line option can accept cheat keys too. */
 BOOL Cheats_IsKnownIniKey(LPCWSTR key)
 {
     for (int i = 0; i < CHEATS_ENV_COUNT; i++) {
@@ -73,6 +112,11 @@ BOOL Cheats_IsKnownIniKey(LPCWSTR key)
     return FALSE;
 }
 
+/* Fills in the environment variable name and value for cheat i. Returns
+ * FALSE (and an empty value) when the cheat is set to "Game setting" (index
+ * 0), telling the caller to leave the variable unset so the game falls back
+ * to its own Cheats menu; otherwise returns TRUE with the chosen value
+ * copied into value (truncated-safe via StringCchCopyW, capacity cap). */
 BOOL Cheats_Env(int i, LPCWSTR *name, LPWSTR value, size_t cap)
 {
     *name = k_cheats[i].env_name;
@@ -84,6 +128,8 @@ BOOL Cheats_Env(int i, LPCWSTR *name, LPWSTR value, size_t cap)
     return TRUE;
 }
 
+/* Counts how many of the 5 cheats are set to something other than "Game
+ * setting" (s_sel[i] != 0); used for the "Cheats (N on)..." button label. */
 int Cheats_ActiveCount(void)
 {
     int n = 0;
@@ -93,8 +139,15 @@ int Cheats_ActiveCount(void)
     return n;
 }
 
+/* Scales a 96-DPI layout value to pixels for dpi; the local equivalent of
+ * hitz_launcher.c's ScaleDpi/SX, kept as its own small helper since this
+ * file does not include hitz_launcher.c. */
 static int Px(int v, UINT dpi) { return MulDiv(v, (int)dpi, 96); }
 
+/* Sets the Cheats button's text to "Cheats..." (nothing active) or
+ * "Cheats (N on)..." (N cheats set away from "Game setting"). Called once
+ * when the button is created and again after the player presses OK in the
+ * dialog. */
 void Cheats_UpdateButton(HWND button)
 {
     wchar_t t[40];
@@ -107,6 +160,13 @@ void Cheats_UpdateButton(HWND button)
     SetWindowTextW(button, t);
 }
 
+/* Creates the "Cheats..." push button positioned just to the left of the
+ * Play button (control id 1014, IDC_PLAY in hitz_launcher.c; hardcoded here
+ * rather than shared via the header, since launcher_cheats.h intentionally
+ * has no dependency on hitz_launcher.c's control-id defines), and sets its
+ * initial label via Cheats_UpdateButton. Returns NULL if the Play button
+ * cannot be found or its rect cannot be read (should not happen: the
+ * launcher always creates Play before calling this). */
 HWND Cheats_CreateButton(HWND parent, HINSTANCE inst, int id, UINT dpi)
 {
     HWND play = GetDlgItem(parent, 1014);           /* IDC_PLAY */
@@ -131,11 +191,20 @@ HWND Cheats_CreateButton(HWND parent, HINSTANCE inst, int id, UINT dpi)
 #define IDC_CH_CANCEL 2111
 #define IDC_CH_RESET  2112
 
+/* State for the one cheats dialog that can be open at a time: the combo box
+ * handle for each cheat, whether the message loop in Cheats_ShowDialog
+ * should stop (done, set by WM_DESTROY) and whether the player confirmed
+ * with OK (ok, the dialog's return value). Zeroed at the top of every
+ * Cheats_ShowDialog call. */
 static struct {
     HWND combo[CHEATS_ENV_COUNT];
     BOOL done, ok;
 } s_dlg;
 
+/* Copies every combo box's current selection into s_sel (clamped to 0 if
+ * the control reports an error or an out-of-range index), committing the
+ * dialog's in-progress choices. Called when OK is pressed, before the
+ * dialog is destroyed. */
 static void DlgSave(void)
 {
     for (int i = 0; i < CHEATS_ENV_COUNT; i++) {
@@ -144,6 +213,12 @@ static void DlgSave(void)
     }
 }
 
+/* Window procedure for the Cheats dialog. OK (button or IDOK, e.g. Enter)
+ * saves the selections and closes; Cancel (button or IDCANCEL, e.g. Esc)
+ * closes without saving; "All off" resets every combo to index 0 ("Game
+ * setting") without closing the dialog. WM_CLOSE (the system close button)
+ * also just destroys the window (acting like Cancel). WM_DESTROY marks the
+ * dialog done so Cheats_ShowDialog's message loop can exit. */
 static LRESULT CALLBACK CheatsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -176,6 +251,9 @@ static LRESULT CALLBACK CheatsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+/* Thin CreateWindowExW wrapper for a dialog child control (label, combo or
+ * button), applying the shared UI font (f) if given. Always WS_CHILD |
+ * WS_VISIBLE plus the caller's extra style bits. */
 static HWND Child(HWND p, LPCWSTR cls, LPCWSTR text, DWORD style, int id, int x, int y, int w, int h, HFONT f)
 {
     HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, p,
@@ -186,6 +264,19 @@ static HWND Child(HWND p, LPCWSTR cls, LPCWSTR text, DWORD style, int id, int x,
     return c;
 }
 
+/* Builds and runs the modal-style Cheats dialog: registers the window class
+ * once (GetClassInfoExW guards against re-registering on a later call),
+ * creates the popup window centred under owner, lays out one label + combo
+ * + "(code XXXX)" row per cheat plus the explanatory text, "All off", OK and
+ * Cancel buttons, disables owner (classic modal behaviour) and pumps this
+ * window's own message loop until s_dlg.done is set by WM_DESTROY. A
+ * WM_QUIT seen while the dialog is open is reposted so the main window's
+ * loop still sees it after this function returns. Re-enables and refocuses
+ * owner before returning. Returns FALSE immediately, without creating or
+ * showing anything, if the window itself could not be created. Returns
+ * TRUE only if the player pressed OK (s_dlg.ok); Cancel, the system close
+ * button and Esc all return FALSE with s_sel left untouched by this call
+ * (DlgSave is only reached on OK). */
 BOOL Cheats_ShowDialog(HWND owner, HFONT font, UINT dpi)
 {
     static const wchar_t cls[] = L"HitzCheatsWindow";

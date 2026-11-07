@@ -3,6 +3,16 @@
 
 usage: hostprof_resolve.py <samples.txt> <exe.map> [top_n]
 Prints per-thread totals, then the hottest functions overall and per busy thread.
+
+hostprof_win.c (HITZ_HOSTPROF=1) writes samples.txt as plain text: a header
+line with the exe's load base, "mod" lines naming other loaded modules and
+their address range, then one line per stack sample as "<tid> <rip-hex>
+<count>", where the top bit of rip is a "waiting" flag the profiler sets
+when the sampled thread was blocked rather than running. This script turns
+those raw addresses into function names by looking them up in the MSVC
+/MAP file for the build that produced the exe, and prints a short report.
+It is a standalone, run-once script: no functions, no imports beyond the
+standard library, and no state kept between runs.
 """
 import bisect, collections, re, sys
 
@@ -26,6 +36,7 @@ syms.sort()
 addrs = [s[0] for s in syms]
 
 def name(rva):
+    """Name of the symbol whose range covers rva, or "?" if none does."""
     i = bisect.bisect_right(addrs, rva) - 1
     if i < 0:
         return "?"
@@ -39,6 +50,7 @@ for l in lines:
         _, b0, sz, nm = l.split(" ", 3)
         mods.append((int(b0, 16), int(sz, 16), nm))
 def modname(rip):
+    """Name of the loaded module (DLL/exe) containing rip, for addresses outside the exe's own RVA range."""
     for b0, sz, nm in mods:
         if b0 <= rip < b0 + sz:
             return "<%s>" % nm
@@ -53,6 +65,9 @@ for l in lines[1:]:
         continue
     tid, rip, n = int(p[0]), int(p[1], 16), int(p[2])
     per_t[tid] += n
+    # Top bit of rip: set by hostprof_win.c when the thread was waiting
+    # (blocked on a lock/event) rather than actively executing, so its
+    # samples can be separated from real CPU time below.
     via = rip >> 63
     rip &= (1 << 63) - 1
     rva = rip - base
@@ -76,6 +91,8 @@ print("== hottest functions (all threads)")
 for f, n in fn_all.most_common(top):
     print("  %7d %5.1f%%  %s" % (n, 100.0 * n / tot, f))
 import os
+# HP_TIDS/HP_N let a caller focus on specific thread ids instead of the
+# busiest three, and control how many functions are listed per thread.
 _want = [int(x) for x in os.environ.get("HP_TIDS", "").split(",") if x]
 for t, _ in (per_t.most_common(3) if not _want else [(x, 0) for x in _want]):
     tt = per_t[t]

@@ -5,12 +5,27 @@
  * sub_00253E30 override in recomp_manual.c. HITZ_KICK_WAIT=1 there runs the
  * original instead (A/B).
  * Regenerate this file if the recompiler's output for sub_00253E30 changes.
+ *
+ * No environment variables are read directly in this file; HITZ_KICK_WAIT is
+ * read by the caller in recomp_manual.c, which decides whether this function
+ * or the generated original runs. Runs on whichever guest thread calls the
+ * D3D KickOff wrapper (normally the game's main/render thread).
  */
 #define RECOMP_GENERATED_CODE
 #include "recomp/gen/recomp_funcs.h"
 #include <math.h>
 #include <intrin.h>
 
+/* Lifted body of the guest function at 0x00253E30 (D3D's KickOff), labels
+ * and all, except that the PFB write-buffer flush (device+0x100410 bit
+ * 0x10000) is cleared immediately below instead of being polled until the
+ * executor thread clears it, and an _mm_mfence replaces that spin to keep
+ * pushbuffer writes ordered before PUT is published. Side effects: writes
+ * the device's PFB flush register and the pushbuffer PUT pointer in guest
+ * memory (ecx/esi fields at the offsets named in the labels below); no
+ * return value (void), matching the original's register-based ABI (uses the
+ * global guest registers ecx/eax/edx/esi and the guest stack via
+ * PUSH32/POP32). Falls straight through to RET; never fails. */
 void hitz_kick_impl(void)
 {
     int _flags = 0; /* fallback flag var */

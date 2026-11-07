@@ -8,6 +8,56 @@
  *   cl /nologo /W4 /WX /O2 /utf-8 /DUNICODE /D_UNICODE hitz_launcher.c /link
  *      /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib shell32.lib
  *      dxgi.lib xinput.lib ole32.lib windowscodecs.lib
+ *
+ * What this program is: the window that appears when the player double
+ * clicks HitzLauncher.exe. It shows a Display/Controls/Diagnostics settings
+ * window plus a separate Cheats window (launcher_cheats.c/.h), loads and
+ * saves the chosen settings to hitz_settings.ini next to the exe, and on
+ * Play builds the environment variables the game executable
+ * (hitz_pro_recomp.exe, see ResolvePaths) reads at startup and launches it
+ * as a child process, hiding the launcher window until the game exits.
+ *
+ * Key concepts:
+ *   - SettingDef / g_settings[]: one row per Display/Controls/Diagnostics
+ *     setting that is a fixed-choice combo box or a checkbox. Each row ties
+ *     together an ini key, an environment variable name, the set of ini
+ *     values, the (optionally different) set of environment values, the
+ *     combo box display text, and the Win32 control id. Index order must
+ *     match the control creation order in CreateAllControls.
+ *   - GPU adapter (k_gpu_ini_key / k_gpu_env_name) and the cheats (see
+ *     launcher_cheats.c) are handled outside g_settings because their value
+ *     space is not a fixed compile-time enum (the GPU list is queried from
+ *     DXGI; the cheats module owns its own small table).
+ *   - g_static_env[]: environment variables the game always needs that are
+ *     not exposed as a launcher setting; they are applied only if the
+ *     launcher's own process environment does not already define them, so a
+ *     developer running the exe from a shell with RECOMP_* overrides set is
+ *     not overridden.
+ *   - AppSettings holds the in-memory ini values (as wide strings); AppPaths
+ *     holds every path this program needs, resolved once at startup from the
+ *     exe's own location; AppState (g_app) is the single global holding both
+ *     plus the GUI handles, since this is a single-window, single-instance
+ *     program with no need for per-window user data.
+ *
+ * Environment variables read directly by this program:
+ *   - none at start-up: the ini file is the source of truth; env vars are
+ *     only read (via GetEnvironmentVariableW) to decide whether a
+ *     g_static_env entry should be left alone (see BuildEnvList).
+ *
+ * Environment variables this program writes (for the child game process),
+ * see README.md "Settings" for the full table: RECOMP_FULLSCREEN,
+ * RECOMP_WINDOW_SCALE, RECOMP_PRESENT_FILTER, HITZ_PACING,
+ * HITZ_REFRESH_SWITCH, RECOMP_USB_PADS, RECOMP_KEYBOARD, HITZ_SDL_PADS,
+ * HITZ_DEBUG, HITZ_GPU_ADAPTER, HITZ_CHEAT_* (5 cheats, see
+ * launcher_cheats.c), and the g_static_env defaults (RECOMP_PB_EXEC,
+ * RECOMP_VBLANK, RECOMP_AC97_READY, RECOMP_FB_WINDOW, RECOMP_D3D_PRESENT,
+ * RECOMP_USB, HITZ_GPU).
+ *
+ * Threading: single-threaded, classic Win32 message loop (RunGui). The one
+ * exception is LaunchGame, which pumps messages itself in a modal-like loop
+ * while waiting for the child game process to exit, so the launcher window
+ * keeps repainting/responding (though hidden) and still sees its own
+ * WM_QUIT. There is no worker thread anywhere in this file.
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -60,6 +110,12 @@ typedef BOOL(WINAPI *SystemParametersInfoForDpiProc)(UINT, UINT, PVOID, UINT, UI
 static GetDpiForWindowProc g_pGetDpiForWindow = NULL;
 static SystemParametersInfoForDpiProc g_pSystemParametersInfoForDpi = NULL;
 
+/* Turns on per-monitor DPI awareness (V2 API if present, else the older
+ * process-wide SetProcessDPIAware), and resolves the two newer DPI query
+ * functions by GetProcAddress so the binary still loads and runs (at 96 DPI
+ * behaviour) on Windows versions that lack them. Called once from RunGui,
+ * before the window class is registered. No return value: failure just
+ * means the fallbacks in DpiForWindow/CreateUiFont are used instead. */
 static void InitDpiSupport(void)
 {
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
@@ -82,6 +138,11 @@ static void InitDpiSupport(void)
         (SystemParametersInfoForDpiProc)(void *)GetProcAddress(user32, "SystemParametersInfoForDpi");
 }
 
+/* Returns the DPI the given window is currently shown at: GetDpiForWindow
+ * when available (correct per-monitor value), else the DPI of the primary
+ * display's device context (good enough pre-Windows 10 1607, where every
+ * monitor effectively shares one DPI). Falls back to 96 (100%) if even that
+ * fails, so callers never have to guard against a zero/garbage DPI. */
 static UINT DpiForWindow(HWND hwnd)
 {
     if (g_pGetDpiForWindow != NULL) {
@@ -99,6 +160,9 @@ static UINT DpiForWindow(HWND hwnd)
     return (UINT)((dpi > 0) ? dpi : 96);
 }
 
+/* Scales a layout value given in 96-DPI ("design") pixels to the pixel size
+ * for the given DPI, e.g. ScaleDpi(150, 144) = 225 at 150% scaling. Used via
+ * the SX() macro throughout CreateAllControls and friends. */
 static int ScaleDpi(int value, UINT dpi)
 {
     return MulDiv(value, (int)dpi, 96);
@@ -108,6 +172,12 @@ static int ScaleDpi(int value, UINT dpi)
 /* Error reporting                                                     */
 /* ------------------------------------------------------------------ */
 
+/* Formats GetLastError() as readable text (via FormatMessageW) and shows it
+ * in a message box prefixed with the caller-supplied context string, e.g.
+ * "Could not start hitz_pro_recomp.exe.". If FormatMessageW itself fails
+ * (unknown error code), falls back to showing just the numeric code. Must
+ * be called right after the failing API, before any other call clobbers
+ * GetLastError(). */
 static void ShowWin32Error(HWND owner, LPCWSTR context)
 {
     DWORD err = GetLastError();
@@ -132,6 +202,9 @@ static void ShowWin32Error(HWND owner, LPCWSTR context)
 /* Settings table                                                      */
 /* ------------------------------------------------------------------ */
 
+/* Control ids for every child window of the main settings window (also used
+ * as WM_COMMAND notification sources in WndProc). IDC_CHEATS is numbered
+ * apart (1050) because it is created later, by launcher_cheats.c. */
 #define IDC_MODE        1001
 #define IDC_SCALE       1002
 #define IDC_PICTURE     1003
@@ -227,26 +300,43 @@ static const StaticEnvEntry g_static_env[] = {
 
 #define STATIC_ENV_COUNT (int)(sizeof(g_static_env) / sizeof(g_static_env[0]))
 
+/* Longest value a single setting's string (ini or env) can hold, in wchar_t
+ * including the terminator; the GPU adapter name needs its own, larger cap
+ * since DXGI adapter descriptions can be long. */
 #define SETTING_VALUE_CAP 128
 #define GPU_VALUE_CAP 256
 
+/* The complete set of settings as loaded from / about to be saved to the
+ * ini file, as raw wide strings (one slot per g_settings[] entry, in the
+ * same order), plus the GPU adapter name (empty = "Automatic", i.e. let the
+ * game pick the default DXGI adapter). */
 typedef struct {
     wchar_t values[SETTING_COUNT][SETTING_VALUE_CAP];
     wchar_t gpu_adapter[GPU_VALUE_CAP]; /* empty string means "Automatic" */
 } AppSettings;
 
+/* One environment variable to apply to the child process, as built by
+ * BuildEnvList. "unset" is used instead of an empty value for variables the
+ * game should decide the default of itself (passing an empty string would
+ * still define the variable). */
 typedef struct {
     wchar_t name[64];
     wchar_t value[GPU_VALUE_CAP];
     BOOL unset; /* TRUE => unset the variable rather than set it */
 } EnvEntry;
 
+/* Upper bound on entries BuildEnvList can produce: one per g_settings[]
+ * entry, one for the GPU adapter, one per cheat, plus the static defaults. */
 #define MAX_ENV_ENTRIES (SETTING_COUNT + 1 + STATIC_ENV_COUNT + CHEATS_ENV_COUNT)
 
 /* ------------------------------------------------------------------ */
 /* Application paths                                                   */
 /* ------------------------------------------------------------------ */
 
+/* Every filesystem path the launcher needs, resolved once at startup by
+ * ResolvePaths from the launcher exe's own location. hitz_dir is the game
+ * install folder (where hitz_settings.ini, the build/ and game/
+ * subdirectories, and hitz_stderr.log live). */
 typedef struct {
     wchar_t hitz_dir[MAX_PATH];
     wchar_t ini_path[MAX_PATH];
@@ -256,12 +346,24 @@ typedef struct {
     BOOL game_found;
 } AppPaths;
 
+/* Returns TRUE only for an existing, non-directory file at path. Used to
+ * probe for hitz_pro_recomp.exe, default.xbe and optional cover art/SDL2.dll
+ * without needing a full CreateFile just to check existence. */
 static BOOL FileExistsW(LPCWSTR path)
 {
     DWORD attrs = GetFileAttributesW(path);
     return (attrs != INVALID_FILE_ATTRIBUTES) && ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0);
 }
 
+/* Works out every path in AppPaths from the launcher exe's own location.
+ * The exe can live either directly in the hitz_pro folder (next to
+ * build\hitz_pro_recomp.exe) or one level up (e.g. copied to the repo root
+ * by setup, or run from a "dist" folder); this tries the exe's own
+ * directory first, then its parent, and falls back to the exe's own
+ * directory if neither has the built game, so paths are still produced
+ * (just with game_found left FALSE) rather than failing outright. Returns
+ * FALSE only if the exe's own path could not be read or any of the
+ * generated paths would overflow MAX_PATH. */
 static BOOL ResolvePaths(AppPaths *paths)
 {
     wchar_t exePath[MAX_PATH];
@@ -312,6 +414,10 @@ static BOOL ResolvePaths(AppPaths *paths)
 
 static const wchar_t *k_ini_section = L"settings";
 
+/* Fills *out from the ini file at iniPath: every g_settings[] value (falling
+ * back to its default_ini_value if the key is missing or the file does not
+ * exist yet), the GPU adapter name, and (via Cheats_Load) the cheat
+ * selections. Called once at startup before the window is created. */
 static void LoadSettings(LPCWSTR iniPath, AppSettings *out)
 {
     for (int i = 0; i < SETTING_COUNT; i++) {
@@ -324,6 +430,10 @@ static void LoadSettings(LPCWSTR iniPath, AppSettings *out)
     Cheats_Load(iniPath);
 }
 
+/* Writes every value in *in (settings, GPU adapter, and via Cheats_Save the
+ * cheat selections) back to the ini file at iniPath, creating it if needed.
+ * Called on Play and on Quit, after SaveAllControlsIntoSettings has copied
+ * the current control states into g_app.settings. */
 static void SaveSettings(LPCWSTR iniPath, const AppSettings *in)
 {
     for (int i = 0; i < SETTING_COUNT; i++) {
@@ -405,6 +515,11 @@ static int BuildEnvList(const AppSettings *s, EnvEntry entries[MAX_ENV_ENTRIES])
     return n;
 }
 
+/* Applies every entry BuildEnvList produces to this process's own
+ * environment (SetEnvironmentVariableW with NULL value unsets), so the
+ * subsequently created child process (CreateProcessW inherits environment by
+ * default) sees them. Called from LaunchGame just before starting the
+ * game. */
 static void ApplyEnvironment(const AppSettings *s)
 {
     EnvEntry entries[MAX_ENV_ENTRIES];
@@ -414,6 +529,11 @@ static void ApplyEnvironment(const AppSettings *s)
     }
 }
 
+/* Supports "HitzLauncher.exe --print-env": writes every variable BuildEnvList
+ * would set, one "NAME=value\r\n" line per entry (unset entries print as
+ * "NAME=\r\n"), UTF-8 encoded, to the process's stdout handle. Lets a script
+ * or another tool see what the launcher would pass to the game without
+ * actually starting it. Does nothing if stdout is not redirected/available. */
 static void PrintEnvToStdout(const AppSettings *s)
 {
     EnvEntry entries[MAX_ENV_ENTRIES];
@@ -442,6 +562,10 @@ static void PrintEnvToStdout(const AppSettings *s)
 /* Command-line handling (--set KEY=VALUE, --print-env)                */
 /* ------------------------------------------------------------------ */
 
+/* Returns TRUE if key names a setting ini key (g_settings[] or the GPU
+ * adapter key) or a cheat ini key (Cheats_IsKnownIniKey); used by
+ * ParseCommandLine to reject unknown --set keys rather than writing
+ * arbitrary keys into hitz_settings.ini. */
 static BOOL IsKnownIniKey(LPCWSTR key)
 {
     if (Cheats_IsKnownIniKey(key)) {
@@ -498,6 +622,12 @@ static BOOL ParseCommandLine(LPCWSTR iniPath)
 /* GPU adapter enumeration (DXGI)                                      */
 /* ------------------------------------------------------------------ */
 
+/* Fills the GPU combo box with "Automatic" followed by the description of
+ * every DXGI adapter that is not a software (WARP) adapter, by creating a
+ * DXGI 1.1 factory and calling EnumAdapters1 until it reports
+ * DXGI_ERROR_NOT_FOUND. Does nothing (combo stays with only "Automatic") if
+ * CreateDXGIFactory1 fails, e.g. no DXGI 1.1 support. Called once at
+ * WM_CREATE. */
 static void EnumerateGpuAdapters(HWND comboBox)
 {
     SendMessageW(comboBox, CB_RESETCONTENT, 0, 0);
@@ -542,6 +672,16 @@ typedef void (*SDL_Quit_t)(void);
 
 #define SDL_INIT_GAMECONTROLLER 0x00002000u
 
+/* Lists every controller the launcher can see in the "Connected
+ * controllers" list box: first the XInput slots (0..XUSER_MAX_COUNT-1) that
+ * answer XInputGetState, then, if build\SDL2.dll exists next to the game,
+ * every SDL joystick/game controller (named by SDL_GameControllerNameForIndex
+ * when it is recognised as a game controller, else by
+ * SDL_JoystickNameForIndex). SDL2.dll is loaded and freed again on every
+ * call rather than kept resident, since this only runs when the window is
+ * created or Refresh is pressed. Shows "No controllers found" if the list
+ * would otherwise be empty. Missing SDL2.dll, or any of its exports missing,
+ * is treated as "no SDL controllers" rather than an error. */
 static void RefreshControllerList(HWND listBox, LPCWSTR hitzDir)
 {
     SendMessageW(listBox, LB_RESETCONTENT, 0, 0);
@@ -606,7 +746,10 @@ static void RefreshControllerList(HWND listBox, LPCWSTR hitzDir)
 /* Launching the game                                                   */
 /* ------------------------------------------------------------------ */
 
-/* The "Debug logging" box. */
+/* Reports the current state of the Debug logging checkbox from settings
+ * (not from the live control -- called before SaveAllControlsIntoSettings
+ * in LaunchGame's caller, so settings already holds it). Decides whether
+ * the game's stdout/stderr go to hitz_stderr.log or to NUL. */
 static BOOL DebugLogging(const AppSettings *settings)
 {
     int i;
@@ -616,6 +759,16 @@ static BOOL DebugLogging(const AppSettings *settings)
     return FALSE;
 }
 
+/* Applies the environment, starts hitz_pro_recomp.exe as a child process in
+ * paths->hitz_dir with its stdout/stderr redirected to the debug log (or NUL
+ * when debug logging is off) and stdin redirected to NUL, hides the
+ * launcher window while the game runs, pumps the launcher's own message
+ * queue so it stays responsive (though hidden) until the child exits, then
+ * shows the launcher again and reports a non-zero exit code to the player.
+ * Runs on the UI thread; blocks it for the whole length of the game session
+ * (this is the point of hiding the window instead of using a true modal
+ * wait). On failure to create the log file or start the process, reports
+ * the error and returns without touching the window state further. */
 static void LaunchGame(HWND mainWnd, const AppPaths *paths, const AppSettings *settings)
 {
     const BOOL debug = DebugLogging(settings);
@@ -717,6 +870,12 @@ wait_done:
 /* GUI                                                                  */
 /* ------------------------------------------------------------------ */
 
+/* GUI state for the one launcher window this process ever creates: paths
+ * and settings loaded at startup, the handle of each Display/Controls
+ * setting's combo box or checkbox (parallel to g_settings[]), the GPU combo
+ * and controller list box, the shared UI font, and the DPI those controls
+ * are currently laid out for (kept so WM_DPICHANGED knows the old-to-new
+ * scale factor). Zero-initialised at the top of wWinMain. */
 typedef struct {
     AppPaths paths;
     AppSettings settings;
@@ -730,30 +889,41 @@ typedef struct {
 
 static AppState g_app;
 
+/* Thin CreateWindowExW wrapper for a STATIC (label) control; no control id
+ * since labels are never addressed individually. */
 static HWND MakeStatic(HWND parent, HINSTANCE inst, LPCWSTR text, int x, int y, int w, int h)
 {
     return CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE,
                             x, y, w, h, parent, NULL, inst, NULL);
 }
 
+/* Thin CreateWindowExW wrapper for a BS_GROUPBOX (the Display/Controls/
+ * Diagnostics frame with a caption); purely visual, no control id. */
 static HWND MakeGroupBox(HWND parent, HINSTANCE inst, LPCWSTR text, int x, int y, int w, int h)
 {
     return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                             x, y, w, h, parent, NULL, inst, NULL);
 }
 
+/* Thin CreateWindowExW wrapper for a push button; isDefault selects
+ * BS_DEFPUSHBUTTON (drawn with the bold border, activated by Enter) for
+ * exactly one button per dialog, normally Play. */
 static HWND MakeButton(HWND parent, HINSTANCE inst, LPCWSTR text, int id, int x, int y, int w, int h, BOOL isDefault)
 {
     DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | (isDefault ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON);
     return CreateWindowExW(0, L"BUTTON", text, style, x, y, w, h, parent, (HMENU)(INT_PTR)id, inst, NULL);
 }
 
+/* Thin CreateWindowExW wrapper for a BS_AUTOCHECKBOX, used for every boolean
+ * setting (g_settings[i].count == 0). */
 static HWND MakeCheckbox(HWND parent, HINSTANCE inst, LPCWSTR text, int id, int x, int y, int w, int h)
 {
     return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                             x, y, w, h, parent, (HMENU)(INT_PTR)id, inst, NULL);
 }
 
+/* Thin CreateWindowExW wrapper for a drop-down-list combo box (no free text
+ * entry: CBS_DROPDOWNLIST), used for every enum setting and the GPU combo. */
 static HWND MakeCombo(HWND parent, HINSTANCE inst, int id, int x, int y, int w, int h)
 {
     return CreateWindowExW(0, L"COMBOBOX", NULL,
@@ -761,6 +931,9 @@ static HWND MakeCombo(HWND parent, HINSTANCE inst, int id, int x, int y, int w, 
                             x, y, w, h, parent, (HMENU)(INT_PTR)id, inst, NULL);
 }
 
+/* Thin CreateWindowExW wrapper for the "Connected controllers" list box;
+ * LBS_NOSEL since it is read-only / informational, not something the
+ * player selects an item in. */
 static HWND MakeListBox(HWND parent, HINSTANCE inst, int id, int x, int y, int w, int h)
 {
     return CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
@@ -768,6 +941,9 @@ static HWND MakeListBox(HWND parent, HINSTANCE inst, int id, int x, int y, int w
                             x, y, w, h, parent, (HMENU)(INT_PTR)id, inst, NULL);
 }
 
+/* Sends WM_SETFONT to every direct child of parent (one level, not
+ * recursive); called once after all controls are created and again after a
+ * DPI change replaces the font. */
 static void ApplyFontToChildren(HWND parent, HFONT font)
 {
     HWND child = GetWindow(parent, GW_CHILD);
@@ -777,6 +953,12 @@ static void ApplyFontToChildren(HWND parent, HFONT font)
     }
 }
 
+/* Reflects g_app.settings.values[index] into the live control for that
+ * setting: ticks/unticks the checkbox for a boolean, or selects the
+ * matching combo box item for an enum (falling back to the setting's
+ * default, then to index 0, if the stored value does not match any known
+ * ini_values entry, e.g. an ini edited by hand). hwnd is unused (kept for a
+ * uniform call signature with other per-setting helpers). */
 static void LoadSettingIntoControl(HWND hwnd, int index)
 {
     const SettingDef *d = &g_settings[index];
@@ -804,6 +986,10 @@ static void LoadSettingIntoControl(HWND hwnd, int index)
     SendMessageW(ctrl, CB_SETCURSEL, 0, 0);
 }
 
+/* Reverse of LoadSettingIntoControl: reads the live control for setting
+ * index (checkbox state, or selected combo index) back into
+ * g_app.settings.values[index], defaulting to index 0 (or "0" for a
+ * checkbox) if the control reports an error or an out-of-range selection. */
 static void SaveControlIntoSetting(int index)
 {
     const SettingDef *d = &g_settings[index];
@@ -826,6 +1012,10 @@ static void SaveControlIntoSetting(int index)
     StringCchCopyW(g_app.settings.values[index], SETTING_VALUE_CAP, d->ini_values[sel]);
 }
 
+/* Calls SaveControlIntoSetting for every g_settings[] entry, then reads the
+ * GPU combo selection into g_app.settings.gpu_adapter (index 0, "Automatic",
+ * or an empty/overlong name, maps to "" so the game picks its own default
+ * adapter). Called just before SaveSettings on both Play and Quit. */
 static void SaveAllControlsIntoSettings(void)
 {
     for (int i = 0; i < SETTING_COUNT; i++) {
@@ -845,6 +1035,9 @@ static void SaveAllControlsIntoSettings(void)
     }
 }
 
+/* Mode (windowed/fullscreen) combo at index 0 decides whether Window size
+ * (index 1) means anything: fullscreen always covers the whole monitor, so
+ * the scale combo is greyed out while Fullscreen is selected. */
 static void UpdateScaleEnabled(HWND hwnd)
 {
     (void)hwnd;
@@ -853,6 +1046,13 @@ static void UpdateScaleEnabled(HWND hwnd)
     EnableWindow(g_app.combo_or_check[1], windowed);
 }
 
+/* Creates the three group boxes (Display/Controls/Diagnostics) and every
+ * label/combo/checkbox/button inside them at fixed, hand-tuned positions
+ * (in 96-DPI units, scaled to the real DPI by the SX() macro), storing the
+ * per-setting control handles into g_app.combo_or_check in g_settings[]
+ * order. Called once from WM_CREATE; the Cheats button is added separately
+ * by Cheats_CreateButton since it is positioned relative to Play, which
+ * must exist first. */
 static void CreateAllControls(HWND hwnd, HINSTANCE inst, UINT dpi)
 {
 #define SX(v) ScaleDpi((v), dpi)
@@ -919,6 +1119,9 @@ static void CreateAllControls(HWND hwnd, HINSTANCE inst, UINT dpi)
 #undef SX
 }
 
+/* Fills every enum setting's combo box with its display_values text and
+ * selects the stored value (boolean settings are skipped; see
+ * LoadBoolControls). Called once after CreateAllControls at WM_CREATE. */
 static void PopulateCombos(void)
 {
     for (int i = 0; i < SETTING_COUNT; i++) {
@@ -935,6 +1138,8 @@ static void PopulateCombos(void)
     }
 }
 
+/* Ticks/unticks every boolean setting's checkbox from the stored value
+ * (complement of PopulateCombos, which handles the enum settings). */
 static void LoadBoolControls(void)
 {
     for (int i = 0; i < SETTING_COUNT; i++) {
@@ -951,6 +1156,13 @@ typedef struct {
     UINT from, to;
 } RescaleCtx;
 
+/* EnumChildWindows callback for RescaleChildren: moves and resizes one
+ * child window from the old DPI's layout to the new one, keeping its
+ * position/size proportional (MulDiv by to/from on each of left, top,
+ * width, height). Skips windows that are not a direct child of the target
+ * parent (defensive; EnumChildWindows only visits children, so this should
+ * not trigger) or whose rect cannot be read. Always returns TRUE to keep
+ * enumerating every child. */
 static BOOL CALLBACK RescaleOne(HWND child, LPARAM lParam)
 {
     const RescaleCtx *c = (const RescaleCtx *)lParam;
@@ -988,6 +1200,14 @@ static UINT                s_cover_w, s_cover_h;
 static HBITMAP             s_cover_bmp;
 static int                 s_cover_bw, s_cover_bh;
 
+/* Loads the first of cover.jpg/.jpeg/.png found in dir into s_cover (32bpp
+ * premultiplied BGRA, via WIC), initialising COM and the shared WIC factory
+ * (s_wic) on first use. Idempotent: returns immediately (nonzero) if a
+ * cover is already loaded; does nothing destructive if none of the three
+ * files exists or decoding fails for all of them (s_cover stays NULL, and
+ * the launcher simply shows no cover panel). Called once from CoverLayout
+ * at WM_CREATE. Returns nonzero if a cover image is loaded (whether by this
+ * call or a previous one), zero otherwise. */
 static int CoverLoad(const wchar_t *dir)
 {
     static const wchar_t *names[] = { L"cover.jpg", L"cover.jpeg", L"cover.png" };
@@ -1020,11 +1240,22 @@ static int CoverLoad(const wchar_t *dir)
     return s_cover != NULL;
 }
 
+/* Width in pixels the cover panel should occupy for a window client height
+ * of clientH, preserving the cover image's own aspect ratio; 0 if no cover
+ * is loaded (no panel is drawn and nothing shifts). */
 static int CoverWidth(int clientH)
 {
     return s_cover ? MulDiv(clientH, (int)s_cover_w, (int)s_cover_h) : 0;
 }
 
+/* Returns a device-independent bitmap of the cover image scaled to w x h,
+ * caching the last-built bitmap (s_cover_bmp) and skipping the rescale when
+ * the requested size matches it, since WM_PAINT asks for the same size on
+ * every repaint. Rebuilds (WIC Fant-filtered scale into a freshly created
+ * top-down 32bpp DIB section) whenever the size changes or there is no
+ * cached bitmap yet. Returns NULL if there is no cover, the size is
+ * non-positive, or any WIC/GDI step fails; the caller (WM_PAINT) then simply
+ * paints nothing for the cover. */
 static HBITMAP CoverBitmap(int w, int h)
 {
     IWICBitmapScaler *sc = NULL;
@@ -1055,6 +1286,11 @@ static HBITMAP CoverBitmap(int w, int h)
     return s_cover_bmp;
 }
 
+/* EnumChildWindows callback for CoverLayout: moves one child window right by
+ * lParam pixels (the cover panel's width), keeping its size and vertical
+ * position. Skips the window if its parent cannot be determined, its rect
+ * cannot be read, or (defensively) it turns out not to be a direct child of
+ * that parent. Always returns TRUE to keep enumerating every child. */
 static BOOL CALLBACK ShiftOne(HWND child, LPARAM lParam)
 {
     HWND parent = GetParent(child);
@@ -1085,6 +1321,17 @@ static void CoverLayout(HWND hwnd)
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+/* Main window procedure. WM_CREATE builds every control, loads settings into
+ * them, enumerates GPUs and controllers, and lays out the cover panel if
+ * present; it disables Play and warns if the game has not been built/set up
+ * (paths.game_found is FALSE). WM_COMMAND handles the Mode combo (enables/
+ * disables Window size), the Cheats/Refresh/Open log folder/Quit/Play
+ * buttons. WM_DPICHANGED rescales every child control and rebuilds the UI
+ * font when the window moves to a monitor with a different DPI, honouring
+ * the position/size Windows suggests. WM_PAINT draws the cover bitmap, if
+ * any, at the left edge. WM_DESTROY releases the cover/WIC COM objects and
+ * posts WM_QUIT. Runs on the UI thread only; every other message falls
+ * through to DefWindowProcW. */
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -1217,6 +1464,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+/* Builds a font matching the system message-box font (SPI_GETNONCLIENTMETRICS)
+ * scaled for the given DPI: SystemParametersInfoForDpi when available (the
+ * correct per-monitor result), else SystemParametersInfoW plus a manual
+ * MulDiv on the point size. Falls back to the stock DEFAULT_GUI_FONT if
+ * both APIs fail, so the window is never left without a usable font.
+ * Callers must not delete the returned font if it is DEFAULT_GUI_FONT (a
+ * shared system object). */
 static HFONT CreateUiFont(HWND hwnd, UINT dpi)
 {
     NONCLIENTMETRICSW ncm;
@@ -1243,6 +1497,17 @@ static HFONT CreateUiFont(HWND hwnd, UINT dpi)
     return (font != NULL) ? font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 }
 
+/* Registers the window class, creates the sized-for-96-DPI-then-scaled main
+ * window and runs the modal-message-loop-free standard GetMessageW loop
+ * until WM_QUIT. Window size is computed at the primary monitor's DPI
+ * first (before the window exists, so DpiForWindow cannot be used yet),
+ * then the per-window DPI is re-read once the window is created (it may
+ * differ if a non-primary monitor is the one under the cursor at
+ * creation). Returns 1 immediately, without entering the message loop, if
+ * the window class cannot be registered or the window cannot be created
+ * (ShowWin32Error already reported why). Deletes the UI font on exit unless
+ * it is the shared stock DEFAULT_GUI_FONT. Return value is msg.wParam from
+ * the terminating WM_QUIT, Win32's convention for a GUI app's exit code. */
 static int RunGui(HINSTANCE hInstance, int nShowCmd)
 {
     InitDpiSupport();
@@ -1321,6 +1586,12 @@ static int RunGui(HINSTANCE hInstance, int nShowCmd)
 /* Entry point                                                         */
 /* ------------------------------------------------------------------ */
 
+/* Entry point. Resolves every path (exits with an error if that fails: the
+ * launcher cannot find its own install folder), applies any --set KEY=VALUE
+ * from the command line to the ini file, loads settings (so --set edits are
+ * visible immediately), then either prints the resulting environment and
+ * exits (--print-env, a non-interactive mode used for scripting/debugging)
+ * or runs the normal GUI. */
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nShowCmd)
 {
     (void)hPrevInstance;
